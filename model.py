@@ -85,7 +85,42 @@ class DynamicVideoDataset(Dataset):
             'gop_id': gop_id
         }
 
-# --------------------------- 解码器模块 --------------------------
+# --------------------------- 解码器模块 0 --------------------------
+class DecoderOri(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256, skip_layer=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.skip_layer = skip_layer
+
+        # 定义MLP结构
+        self.linear = nn.ModuleList([
+            nn.Linear(input_dim, hidden_dim),        # 第1层 (120→256)
+            nn.Linear(hidden_dim, hidden_dim),       # 第2层 (256→256)
+            nn.Linear(hidden_dim + input_dim, hidden_dim),  # 第3层 (256+120→256)
+            nn.Linear(hidden_dim, hidden_dim//2)     # 第4层 (256→128)
+        ])
+        
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim//2, 3),
+            nn.Sigmoid()
+        )
+        
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        h = x
+        for i, layer in enumerate(self.linear):
+            if i == self.skip_layer: 
+                h = torch.cat([x, h], dim=-1)
+                
+            h = layer(h)
+            h = self.act(h)
+            
+        return self.output_layer(h)
+
+# --------------------------- 解码器模块 new --------------------------
 class Decoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 256, skip_layer: int = 2,
                  refine_channels: int = 32, refine_blocks: int = 3):
