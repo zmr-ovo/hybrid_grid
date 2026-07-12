@@ -1,0 +1,37 @@
+CUDA_VISIBLE_DEVICES=1 nohup python train.py \
+    -d ./data/bunny \
+    -b 1 \
+    --epochs 1200 \
+    --lr 5e-03 \
+    --grid_levels 10 \
+    --grid_feat_dim 6 \
+    --base_resolution 20 \
+    --finest_resolution 100 \
+    --time_scale 0.1 \
+    --pe_freq 14 \
+    --hidden_dim 256 \
+    --base_res 720 1280 \
+    --fixed_res 720 1280 \
+    --exp_name bunny_new_decoder_modulation \
+    --loss_type L2 \
+    --warmup 0.2 \
+    --out_dir ./output/test > bunny_new_decoder_modulation.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=2 nohup python train.py \
+    -d ./data/bunny \
+    -b 1 \
+    --epochs 1200 \
+    --lr 5e-03 \
+    --grid_levels 10 \
+    --grid_feat_dim 6 \
+    --base_resolution 20 \
+    --finest_resolution 104 \
+    --time_scale 0.1 \
+    --pe_freq 14 \
+    --hidden_dim 256 \
+    --base_res 720 1280 \
+    --fixed_res 720 1280 \
+    --exp_name bunny_new_decoder_modulation_1 \
+    --loss_type L2 \
+    --warmup 0.2 \
+    --out_dir ./output/test > bunny_new_decoder_modulation_1.log 2>&1 &
