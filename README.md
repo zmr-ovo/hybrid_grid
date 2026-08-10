@@ -2,29 +2,26 @@
 
 **Paper:** [*A Hybrid Grid-Based Method for Video Representation*](https://ieeexplore.ieee.org/document/11463942) · **ICASSP 2026**
 
-**技术栈：** PyTorch · Implicit Neural Representation · Multi-Resolution Grid · Positional Encoding · Video Representation
+**技术栈：** PyTorch · Implicit Neural Representation · Multi-Resolution Grid · Adaptive Positional Encoding · Video Representation
 
-面向神经视频表示任务，探索 **显式多分辨率网格与轻量神经网络结合** 的 Hybrid Representation。模型以时空坐标 `(x, y, t)` 为输入，通过多尺度 3D Grid 提取局部时空特征，并结合可学习频率位置编码补充连续坐标信息，在保持表示质量的同时降低解码网络复杂度。
+面向神经视频表示任务，构建 **显式多分辨率时空网格 + 轻量神经网络** 的 Hybrid Representation。模型以时空坐标 `(x, y, t)` 为输入，通过 Multi-Resolution Grids 提取局部时空特征，并结合 Adaptive Positional Encoding、Gate Layer 与 Time-Aware Modulation 提升连续坐标建模能力，在重建质量、压缩效率与解码速度之间取得更好的平衡。
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    C[Spatio-Temporal Coordinate<br/>x, y, t] --> G[Multi-Resolution 3D Grid]
-    C --> P[Learnable Frequency Encoding]
-    G --> F[Feature Fusion]
-    P --> F
-    F --> D[Lightweight Decoder]
-    D --> RGB[RGB Frame]
-```
+<p align="center">
+  <img src="assets/figures/overview.png" width="100%" alt="Hybrid Grid Architecture" />
+</p>
 
-核心思路是将视频表示能力拆分到两类互补特征中：
+整体方法包含四个核心模块：
 
-- **Multi-Resolution Grid：** 在不同空间与时间尺度上存储可学习特征，通过三线性插值得到连续坐标对应的局部表示。
-- **Learnable Frequency Encoding：** 对 `(x, y, t)` 进行多频率正余弦编码，并将频率参数加入训练，用于补充连续位置与高频细节信息。
-- **Lightweight Decoder：** 将 Grid Feature 与 Positional Feature 融合后映射到 RGB，避免将全部视频信息压入大型 MLP。
+- **Multi-Resolution Grids：** 在不同空间 / 时间尺度上存储可学习 latent features，并通过三线性插值查询连续坐标对应的局部表示。
+- **Adaptive Positional Encoding (APE)：** 对 `(x, y, t)` 进行自适应频率编码，补充连续坐标与高频细节信息。
+- **Gate Layer：** 对 Grid Features 与 Positional Embeddings 进行自适应加权融合。
+- **Time-Aware Modulation (TAM)：** 根据时间信息生成调制参数，对融合特征进行动态调整后交由轻量 MLP 解码为 RGB 帧。
+
+论文同时采用 entropy bottlenecks 对 grid latent features 进行压缩，以支持码率控制与率失真评测。
 
 ---
 
@@ -32,31 +29,75 @@ flowchart LR
 
 ### Multi-Resolution Grid Representation
 
-- 构建多层可学习 3D Grid，每层具有不同空间 / 时间分辨率，形成 coarse-to-fine 的时空表示。
-- 根据视频宽高比动态设置 `x / y` 网格分辨率，并通过 `time_scale` 控制时间维度容量。
+- 构建多层可学习 3D Grid，形成 coarse-to-fine 的时空表示。
+- 根据视频宽高比与时间尺度设置网格分辨率，并通过 `time_scale` 控制时间维度容量。
 - 对每个 `(x, y, t)` 坐标查询 8 个邻近顶点，使用三线性插值得到连续 Grid Feature。
 
-### Learnable Positional Encoding
+### Adaptive Positional Encoding
 
 - 使用多频率 `sin / cos` 编码增强连续坐标表达能力。
-- 频率参数可参与训练，使位置编码能够根据视频内容自适应调整，而不是固定使用预设频率。
-- 将显式 Grid 的局部特征与频率编码的连续位置特征结合，形成 Hybrid Representation。
+- 频率参数参与训练，使位置编码能够根据视频内容自适应调整。
+- 与显式 Grid 的局部特征互补，共同构成 Hybrid Representation。
+
+### Gated Fusion & Time-Aware Modulation
+
+- Gate Layer 分别生成 Grid 与 Positional Feature 的门控权重，实现自适应特征融合。
+- TAM 使用时间信息调制融合后的表示，使模型能够更好地建模视频帧间动态变化。
+- 最终通过轻量 MLP 完成从时空特征到 RGB 像素值的映射。
 
 ### Training & Evaluation
 
 - 使用 PyTorch 完成坐标生成、视频帧采样、模型训练、Checkpoint 与 TensorBoard 日志链路。
-- 支持固定分辨率与动态分辨率训练，并可配置 frame interval、grid levels、feature dimension 与 resolution range。
-- 评测阶段统计 **PSNR、MS-SSIM 与 FPS**，同时支持重建帧导出与独立 Eval-only 流程。
+- 支持固定分辨率与动态分辨率训练，可配置 frame interval、grid levels、feature dimension 与 resolution range。
+- 评测阶段统计 **PSNR、MS-SSIM 与 FPS**，并支持重建帧导出与独立 Eval-only 流程。
 
-### Experimental Extensions
+---
 
-当前仓库同时保留了论文工作之后的若干实验性探索，用于进一步研究表示质量与解码效率之间的权衡：
+## Results
 
-- Gated feature fusion
-- Spatio-temporal feature modulation
-- Residual CNN refinement decoder
+### Video Representation Quality
 
-这些模块属于后续实验方向，论文核心方法与完整实验结果请参阅 [IEEE Xplore](https://ieeexplore.ieee.org/document/11463942)。
+<p align="center">
+  <img src="assets/figures/table1.png" width="92%" alt="Video representation PSNR results on Bunny" />
+</p>
+
+在 Bunny 序列上，Ours 在 **0.35M / 0.75M / 1.5M / 3M** 四个模型规模下均取得最高 PSNR，平均达到 **34.79 dB**；在 3M 设置下达到 **37.88 dB**。
+
+### Inference Speed
+
+<p align="center">
+  <img src="assets/figures/table2.png" width="95%" alt="Model inference speed on DAVIS" />
+</p>
+
+在 DAVIS 六个序列上，Ours 的平均推理速度达到 **226.34 FPS**，高于 NeRV、E-NeRV、FFNeRV 与 HNeRV。
+
+### Rate-Distortion Performance
+
+<p align="center">
+  <img src="assets/figures/rd-curve-new.png" width="52%" alt="Rate distortion curve on UVG" />
+</p>
+
+在 UVG 数据集上，Hybrid Grid 在低到中等码率区间呈现更优的 **PSNR–BPP** 权衡，体现了显式 Grid 表示与压缩机制在质量和码率之间的优势。
+
+---
+
+## Ablation Study
+
+<p align="center">
+  <img src="assets/figures/table3.png" width="92%" alt="Ablation study on Bunny" />
+</p>
+
+以 3.0M 模型规模为例，基础 Grids 得到 **37.18 dB**；加入 APE、Gate 与 TAM 后，完整模型达到 **37.88 dB**，表中对应总增益为 **+1.88%**。消融结果表明三个模块均对最终性能有贡献，其中 TAM 带来的提升较为明显。
+
+---
+
+## Qualitative Results
+
+<p align="center">
+  <img src="assets/figures/visual.png" width="100%" alt="Qualitative reconstruction comparison" />
+</p>
+
+可视化结果对比 Ground Truth、NeRV、E-NeRV、FFNeRV、HNeRV 与 Ours。局部放大区域显示，Ours 能更完整地恢复边缘与高频纹理细节。
 
 ---
 
@@ -69,33 +110,17 @@ Shanghai Jiao Tong University
 
 [IEEE Xplore](https://ieeexplore.ieee.org/document/11463942) · DOI: `10.1109/ICASSP55912.2026.11463942`
 
-论文研究显式 Grid Representation 与神经隐式表示的结合，通过多分辨率时空网格承担主要视频内容表示，并使用轻量网络完成连续坐标到像素值的映射。
-
----
-
-## Evaluation
-
-仓库训练与评测流程主要关注以下指标：
-
-| Metric | Purpose |
-| --- | --- |
-| PSNR | 衡量视频帧重建质量 |
-| MS-SSIM | 衡量多尺度结构相似性 |
-| FPS | 衡量模型解码速度 |
-| Parameters | 衡量模型表示与存储开销 |
-
-论文中的完整实验设置、对比方法与结果请参阅 [IEEE Xplore](https://ieeexplore.ieee.org/document/11463942)。
-
 ---
 
 ## Key Modules
 
 | Module | Responsibility |
 | --- | --- |
-| `encoding.py` | Multi-Resolution Grid、三线性插值与可学习 Frequency Encoding |
-| `model.py` | Dataset、HybridGridNet、Feature Fusion 与 Decoder |
+| `encoding.py` | Multi-Resolution Grid、三线性插值与 Frequency Encoding |
+| `model.py` | Dataset、HybridGridNet、Feature Fusion、Modulation 与 Decoder |
 | `train.py` | 训练、Checkpoint、验证、PSNR / MS-SSIM / FPS 评测 |
 | `util.py` | Loss、Metric 与训练辅助函数 |
+| `assets/figures/` | 论文架构图、定量结果与可视化结果 |
 
 ---
 
@@ -137,9 +162,10 @@ python train.py \
 
 ```text
 hybrid_grid/
-├── encoding.py       # Grid / Frequency Encoding
-├── model.py          # Hybrid Grid Network
-├── train.py          # Training & Evaluation
-├── util.py           # Loss / Metrics / Utils
-└── data/             # Example video frames
+├── assets/figures/    # Paper figures and results
+├── encoding.py        # Grid / Frequency Encoding
+├── model.py           # Hybrid Grid Network
+├── train.py           # Training & Evaluation
+├── util.py            # Loss / Metrics / Utils
+└── data/              # Example video frames
 ```
