@@ -1,12 +1,10 @@
 # Hybrid Grid — Neural Video Representation
 
-**Paper:** *A Hybrid Grid-Based Method for Video Representation* · **ICASSP 2026**
+**Paper:** [*A Hybrid Grid-Based Method for Video Representation*](https://ieeexplore.ieee.org/document/11463942) · **ICASSP 2026**
 
 **技术栈：** PyTorch · Implicit Neural Representation · Multi-Resolution Grid · Positional Encoding · Video Representation
 
 面向神经视频表示任务，探索 **显式多分辨率网格与轻量神经网络结合** 的 Hybrid Representation。模型以时空坐标 `(x, y, t)` 为输入，通过多尺度 3D Grid 提取局部时空特征，并结合可学习频率位置编码补充连续坐标信息，在保持表示质量的同时降低解码网络复杂度。
-
-[论文 PDF](paper.pdf)
 
 ---
 
@@ -58,7 +56,7 @@ flowchart LR
 - Spatio-temporal feature modulation
 - Residual CNN refinement decoder
 
-这些模块属于后续实验方向，论文核心方法以 [`paper.pdf`](paper.pdf) 为准。
+这些模块属于后续实验方向，论文核心方法与完整实验结果请参阅 [IEEE Xplore](https://ieeexplore.ieee.org/document/11463942)。
 
 ---
 
@@ -68,6 +66,8 @@ flowchart LR
 Miaoran Zhao, Mufan Liu, Wenjie Huang, Puyue Hou, Yiling Xu  
 Shanghai Jiao Tong University  
 **IEEE ICASSP 2026 — Image and Video Representation**
+
+[IEEE Xplore](https://ieeexplore.ieee.org/document/11463942) · DOI: `10.1109/ICASSP55912.2026.11463942`
 
 论文研究显式 Grid Representation 与神经隐式表示的结合，通过多分辨率时空网格承担主要视频内容表示，并使用轻量网络完成连续坐标到像素值的映射。
 
@@ -84,7 +84,7 @@ Shanghai Jiao Tong University
 | FPS | 衡量模型解码速度 |
 | Parameters | 衡量模型表示与存储开销 |
 
-论文中的完整实验设置、对比方法与结果请参阅 [`paper.pdf`](paper.pdf)。
+论文中的完整实验设置、对比方法与结果请参阅 [IEEE Xplore](https://ieeexplore.ieee.org/document/11463942)。
 
 ---
 
@@ -96,7 +96,6 @@ Shanghai Jiao Tong University
 | `model.py` | Dataset、HybridGridNet、Feature Fusion 与 Decoder |
 | `train.py` | 训练、Checkpoint、验证、PSNR / MS-SSIM / FPS 评测 |
 | `util.py` | Loss、Metric 与训练辅助函数 |
-| `paper.pdf` | ICASSP 2026 论文 |
 
 ---
 
@@ -142,6 +141,5 @@ hybrid_grid/
 ├── model.py          # Hybrid Grid Network
 ├── train.py          # Training & Evaluation
 ├── util.py           # Loss / Metrics / Utils
-├── data/             # Example video frames
-└── paper.pdf         # ICASSP 2026 Paper
+└── data/             # Example video frames
 ```
