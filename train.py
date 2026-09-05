@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from torchvision.utils import save_image
 import torch.optim as optim
+from fps import benchmark_fps
 from model import *
 from util import *
 
@@ -258,7 +259,7 @@ def train(args):
         eval_dir = os.path.join(log_dir, "eval")
         os.makedirs(eval_dir, exist_ok=True)
 
-        val_psnr, val_msssim, val_fps = evaluate(
+        val_psnr, val_msssim = evaluate(
             model,
             val_loader,
             device,
@@ -267,10 +268,23 @@ def train(args):
             log_interval=args.log_interval,
             save_ground_truth=True,
         )
+        benchmark_batch = next(iter(val_loader))
+        benchmark_coords = benchmark_batch['coords'][:1].to(device, non_blocking=True)
+        fps_result = benchmark_fps(
+            model,
+            benchmark_coords,
+            warmup_steps=args.fps_warmup,
+            repeat_steps=args.fps_repeats,
+        )
 
         logging.info(
             f"[Eval-only] 验证集结果 → PSNR: {val_psnr:.2f} dB | "
-            f"MS-SSIM: {val_msssim:.4f} | FPS: {val_fps:.2f}")
+            f"MS-SSIM: {val_msssim:.4f}")
+        logging.info(
+            f"[FPS] 总重建: {fps_result.reconstruction_fps:.2f} | "
+            f"仅 Decoder: {fps_result.decoder_fps:.2f} | "
+            "Codec 编码/解码: N/A"
+        )
 
         # 同步保存结果到 txt 文件
         result_path = os.path.join(eval_dir, "eval_results.txt")
@@ -279,7 +293,14 @@ def train(args):
             f.write(f"模型路径: {args.resume if getattr(args, 'resume', None) else '当前模型'}\n")
             f.write(f"PSNR: {val_psnr:.2f} dB\n")
             f.write(f"MSSSIM: {val_msssim:.4f}\n")
-            f.write(f"FPS: {val_fps:.2f}\n")
+            f.write(f"论文推理FPS: {fps_result.paper_inference_fps:.2f}\n")
+            f.write(f"总重建FPS: {fps_result.reconstruction_fps:.2f}\n")
+            f.write(f"仅Decoder FPS: {fps_result.decoder_fps:.2f}\n")
+            f.write("Codec编码时间(ms): N/A\n")
+            f.write("Codec解码时间(ms): N/A\n")
+            f.write(f"FPS预热次数: {fps_result.warmup_steps}\n")
+            f.write(f"FPS重复次数: {fps_result.repeat_steps}\n")
+            f.write(f"FPS batch size: {fps_result.batch_size}\n")
         logging.info(f"评估结果已保存到: {result_path}")
 
         tb_writer.close()
@@ -376,7 +397,7 @@ def train(args):
         # evaluate
         if (epoch + 1) % args.eval_freq == 0 or epoch >= args.epochs - 10:
             val_start_time = datetime.now()
-            val_psnr, val_msssim, val_fps = evaluate(
+            val_psnr, val_msssim = evaluate(
                 model,
                 val_loader,
                 device,
@@ -390,7 +411,6 @@ def train(args):
 
             tb_writer.add_scalar("val/psnr", val_psnr, epoch + 1)
             tb_writer.add_scalar("val/msssim", val_msssim, epoch + 1)
-            tb_writer.add_scalar("val/fps", val_fps, epoch + 1)
 
             if val_psnr > best_val_psnr:
                 best_val_psnr = val_psnr
@@ -404,7 +424,6 @@ def train(args):
                 f"PSNR: {val_psnr:.2f} dB | "
                 f"BEST: {best_val_psnr:.2f} dB | "
                 f"MSSSIM: {val_msssim:.4f} | "
-                f"FPS: {val_fps:.2f} | "
                 f"TIME: {val_time:.2f}秒 | "
             )
 
@@ -428,7 +447,6 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
              log_interval=50, save_ground_truth=False):
     total_psnr = 0.0
     total_msssim = 0.0
-    inference_time = 0.0
     samples_seen = 0
 
     os.makedirs(save_dir, exist_ok=True) 
@@ -440,19 +458,7 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
         pixels = batch['pixels'].to(device, non_blocking=True)  # (B,3,H,W)
         batch_size = pixels.size(0)
 
-        if batch_idx == 0:
-            model(coords)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        start_time = time.perf_counter()
-
         pred = model(coords)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        inference_time += time.perf_counter() - start_time
         
         if dump_images:
             frame_indices = batch.get('frame_idx')
@@ -476,22 +482,19 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
         samples_seen += batch_size
     
         if batch_idx % log_interval == 0 or batch_idx == len(val_loader) - 1:
-            fps = samples_seen / max(inference_time, 1e-12)
             psnr_tmp = total_psnr / samples_seen
             msssim_tmp = total_msssim / samples_seen
 
             logging.info(
                 f"Step [{batch_idx + 1}/{len(val_loader)}] | " 
                 f"Val PSNR: {psnr_tmp:.2f} dB | "
-                f"Val MSSSIM: {msssim_tmp:.4f} | "
-                f"FPS: {fps:.2f}"
+                f"Val MSSSIM: {msssim_tmp:.4f}"
             )
         
     model.train(was_training)
     avg_psnr = total_psnr / samples_seen
     avg_msssim = total_msssim / samples_seen
-    fps = samples_seen / max(inference_time, 1e-12)
-    return avg_psnr, avg_msssim, fps
+    return avg_psnr, avg_msssim
 
 
 if __name__ == "__main__":
@@ -515,6 +518,10 @@ if __name__ == "__main__":
                     help='warmup epoch ratio compared to the epochs, default=0.2,  added to suffix!!!!')
     parser.add_argument('--eval_only', action='store_true', 
                     help='运行评估模式（不再训练）')
+    parser.add_argument('--fps_warmup', type=int, default=5,
+                    help='FPS评测预热次数 (default: 5)')
+    parser.add_argument('--fps_repeats', type=int, default=20,
+                    help='FPS评测重复次数，至少10次 (default: 20)')
     parser.add_argument('--fixed_res', type=int, nargs=2, default=[720, 1280],
                         help='评估分辨率 [H W] (default: 720 1280)')
     parser.add_argument('--dynamic_res', action='store_true',

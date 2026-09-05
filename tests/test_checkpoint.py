@@ -84,7 +84,7 @@ class EvaluateTest(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            psnr, msssim, fps = evaluate(
+            psnr, msssim = evaluate(
                 model,
                 [batch],
                 torch.device('cpu'),
@@ -94,7 +94,6 @@ class EvaluateTest(unittest.TestCase):
 
         self.assertEqual(psnr, 30.0)
         self.assertEqual(msssim, 0.9)
-        self.assertGreater(fps, 0.0)
         self.assertTrue(model.training)
 
     def test_evaluate_weights_partial_batches_by_sample_count(self):
@@ -115,7 +114,7 @@ class EvaluateTest(unittest.TestCase):
             patch('train.psnr_fn', side_effect=[10.0, 30.0]),
             patch('train.msssim_fn', side_effect=[0.5, 1.0]),
         ):
-            psnr, msssim, _ = evaluate(
+            psnr, msssim = evaluate(
                 model,
                 batches,
                 torch.device('cpu'),
