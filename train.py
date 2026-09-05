@@ -47,14 +47,63 @@ def setup_tb(log_dir:str):
     os.makedirs(tb_dir, exist_ok=True)
     return SummaryWriter(log_dir=tb_dir)
 
-def save_checkpoint(model, optimizer, epoch, best_psnr, path:str):
+MODEL_CONFIG_KEYS = (
+    'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
+    'aspect_ratio', 'time_scale', 'pe_freq', 'hidden_dim',
+)
+
+
+def save_checkpoint(model, optimizer, epoch, best_val_psnr, config, path:str):
     state = {
+        'checkpoint_version': 2,
         'epoch': epoch,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
-        'best_psnr': best_psnr,
+        'best_val_psnr': best_val_psnr,
+        'config': dict(vars(config)),
     }
     torch.save(state, path)
+
+
+def _validate_model_config(saved_config, current_config):
+    if saved_config is None:
+        logging.warning("检查点未保存实验配置，跳过模型配置一致性检查")
+        return
+
+    mismatches = []
+    for key in MODEL_CONFIG_KEYS:
+        if key not in saved_config:
+            continue
+        saved_value = saved_config[key]
+        current_value = getattr(current_config, key)
+        if isinstance(saved_value, list):
+            saved_value = tuple(saved_value)
+        if isinstance(current_value, list):
+            current_value = tuple(current_value)
+        if saved_value != current_value:
+            mismatches.append(f"{key}: checkpoint={saved_value}, current={current_value}")
+
+    if mismatches:
+        details = '; '.join(mismatches)
+        raise ValueError(f"模型配置与检查点不一致: {details}")
+
+
+def load_checkpoint(path, model, device, config, optimizer=None):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"未找到检查点: {path}")
+
+    checkpoint = torch.load(path, map_location=device)
+    _validate_model_config(checkpoint.get('config'), config)
+    model.load_state_dict(checkpoint['state_dict'])
+
+    if optimizer is not None:
+        if 'optimizer' not in checkpoint:
+            raise KeyError("检查点缺少 optimizer 状态，无法恢复训练")
+        optimizer.load_state_dict(checkpoint['optimizer'])
+
+    start_epoch = int(checkpoint.get('epoch', -1)) + 1
+    best_val_psnr = float(checkpoint.get('best_val_psnr', 0.0))
+    return start_epoch, best_val_psnr
 
 def train(args):
     # 初始化
@@ -150,13 +199,38 @@ def train(args):
         logging.info(f"{key}: {value}")
     logging.info("=" * 50 + "\n")
 
+    # 加载检查点
+    start_epoch = 0
+    best_val_psnr = 0.0
+
+    if args.eval_only and not args.resume:
+        raise ValueError("eval_only requires --resume with a valid checkpoint")
+
+    if args.resume:
+        start_epoch, best_val_psnr = load_checkpoint(
+            args.resume,
+            model,
+            device,
+            args,
+            optimizer=None if args.eval_only else optimizer,
+        )
+        logging.info(f"成功加载检查点: {args.resume}")
+
     # 评估
     if args.eval_only:
         logging.info("========== Eval-only ==========")
         eval_dir = os.path.join(log_dir, "eval")
         os.makedirs(eval_dir, exist_ok=True)
 
-        val_psnr, val_msssim = evaluate(model, val_loader, device, args, epoch=-1, save_dir=eval_dir)
+        val_psnr, val_msssim = evaluate(
+            model,
+            val_loader,
+            device,
+            save_dir=eval_dir,
+            dump_images=args.dump_images,
+            log_interval=args.log_interval,
+            save_ground_truth=True,
+        )
 
         logging.info(
             f"[Eval-only] 验证集结果 → PSNR: {val_psnr:.2f} dB | "
@@ -171,31 +245,10 @@ def train(args):
             f.write(f"MSSSIM: {val_msssim:.4f}\n")
         logging.info(f"评估结果已保存到: {result_path}")
 
+        tb_writer.close()
         return
 
-        
-    # 恢复训练（如果存在检查点）
-    start_epoch = 0
-    best_psnr = 0.0  
-    best_loss = float('inf')
-    
-    if args.resume:
-        if os.path.isfile(args.resume):
-            checkpoint = torch.load(args.resume)
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-
-            start_epoch = checkpoint.get("epoch", -1) + 1
-            best_loss = checkpoint.get("loss", float("inf"))
-            best_psnr = checkpoint.get("best_psnr", 0.0)
-
-            logging.info(f"成功恢复检查点：{args.resume}(从epoch {start_epoch}继续训练)")
-        else:
-            logging.warning(f"未找到检查点：{args.resume}，重新开始训练")
-
-
     # 训练
-    is_train_best = False
     train_start_time = time.time()
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -246,9 +299,6 @@ def train(args):
 
         epoch_time = time.time() - epoch_start
         
-        is_train_best = avg_psnr > best_psnr
-        best_psnr = avg_psnr if avg_psnr > best_psnr else best_psnr
-
         # 记录到 TensorBoard
         tb_writer.add_scalar("train/loss", avg_loss, epoch + 1)
         tb_writer.add_scalar("train/psnr", avg_psnr, epoch + 1)
@@ -259,35 +309,46 @@ def train(args):
             f"======  Epoch {epoch+1} 完成 ======"
             f"LOSS: {avg_loss:.4f} | "
             f"PSNR: {avg_psnr:.2f} dB | "
-            f"BEST: {best_psnr:.2f} dB | "
+            f"BEST VAL: {best_val_psnr:.2f} dB | "
             f"MSSSIM: {avg_msssim:.4f} | "
             f"TIME: {epoch_time:.2f}秒 | "
             f"LR: {lr:.3e}"
         )
-        
-        # 保存检查点
-        if epoch % args.log_interval == 0 or epoch == args.epochs - 1:
-            checkpoint_path = os.path.join(log_dir, 'train_latest.pth')
-            save_checkpoint(model, optimizer, epoch, best_psnr, checkpoint_path)
-                    
-        # 更新最佳模型
-        if is_train_best:
-            best_path = os.path.join(log_dir, 'train_best.pth')
-            save_checkpoint(model, optimizer, epoch, best_psnr, best_path)  # 传入定义好的优化器
-            
+
         # evaluate
         if (epoch + 1) % args.eval_freq == 0 or epoch >= args.epochs - 10:
             val_start_time = datetime.now()
-            val_psnr, val_msssim = evaluate(model, val_loader, device, epoch, save_dir=os.path.join(log_dir, 'visualize'))
+            val_psnr, val_msssim = evaluate(
+                model,
+                val_loader,
+                device,
+                save_dir=os.path.join(log_dir, 'visualize'),
+                dump_images=args.dump_images,
+                log_interval=args.log_interval,
+                save_ground_truth=epoch == args.epochs - 1,
+            )
             val_end_time = datetime.now()
             val_time = (val_end_time - val_start_time).total_seconds()
+
+            if val_psnr > best_val_psnr:
+                best_val_psnr = val_psnr
+                best_path = os.path.join(log_dir, 'train_best.pth')
+                save_checkpoint(
+                    model, optimizer, epoch, best_val_psnr, args, best_path,
+                )
 
             logging.info(
                 f"== Epoch {epoch+1} 测试完成 == "
                 f"PSNR: {val_psnr:.2f} dB | "
-                f"BEST: {best_psnr:.2f} dB | "
+                f"BEST: {best_val_psnr:.2f} dB | "
                 f"MSSSIM: {val_msssim:.4f} | "
                 f"TIME: {val_time:.2f}秒 | "
+            )
+
+        if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
+            checkpoint_path = os.path.join(log_dir, 'train_latest.pth')
+            save_checkpoint(
+                model, optimizer, epoch, best_val_psnr, args, checkpoint_path,
             )
     total_time = time.time() - train_start_time
     hours = int(total_time // 3600)
@@ -300,13 +361,15 @@ def train(args):
     tb_writer.close()
         
 @torch.no_grad()        
-def evaluate(model, val_loader, device, epoch, save_dir='visualize'):
+def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
+             log_interval=50, save_ground_truth=False):
     total_psnr = 0.0
     total_msssim = 0.0
     time_list = []
 
     os.makedirs(save_dir, exist_ok=True) 
 
+    was_training = model.training
     model.eval()
     for batch_idx, batch in enumerate(val_loader):
         coords = batch['coords'].to(device, non_blocking=True)  # (B,3,H,W)
@@ -318,7 +381,7 @@ def evaluate(model, val_loader, device, epoch, save_dir='visualize'):
         pred = model(coords)
         time_list.append(time.time() - start_time)
         
-        if args.dump_images:
+        if dump_images:
             B = pred.size(0)
             for i in range(B):
                 sample_id = batch_idx * B + i
@@ -326,7 +389,7 @@ def evaluate(model, val_loader, device, epoch, save_dir='visualize'):
                 pred_img = pred[i].detach().cpu()
                 save_image(pred_img, os.path.join(save_dir, f'pred_{sample_id:05d}.png'))
 
-                if epoch == args.epochs - 1:
+                if save_ground_truth:
                     gt_img = pixels[i].detach().cpu()
                     save_image(gt_img, os.path.join(save_dir, f'gt_{sample_id:05d}.png'))
 
@@ -335,7 +398,7 @@ def evaluate(model, val_loader, device, epoch, save_dir='visualize'):
         total_psnr += psnr
         total_msssim += msssim
     
-        if batch_idx % args.log_interval == 0 or batch_idx == len(val_loader) - 1:
+        if batch_idx % log_interval == 0 or batch_idx == len(val_loader) - 1:
 
             fps = (batch_idx + 1) / sum(time_list)            
             psnr_tmp = total_psnr / (batch_idx + 1)
@@ -348,7 +411,7 @@ def evaluate(model, val_loader, device, epoch, save_dir='visualize'):
                 f"FPS: {fps:.2f}"
             )
         
-    model.train()
+    model.train(was_training)
     avg_psnr = total_psnr / len(val_loader)
     avg_msssim = total_msssim / len(val_loader)
     return avg_psnr, avg_msssim
