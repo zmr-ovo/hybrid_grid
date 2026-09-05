@@ -2,6 +2,7 @@ import os
 import math
 import argparse
 import logging
+import random
 import time
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -46,6 +47,25 @@ def setup_tb(log_dir:str):
     tb_dir = os.path.join(log_dir, 'tensorboard')
     os.makedirs(tb_dir, exist_ok=True)
     return SummaryWriter(log_dir=tb_dir)
+
+
+def seed_everything(seed):
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(_):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 MODEL_CONFIG_KEYS = (
     'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
@@ -107,6 +127,7 @@ def load_checkpoint(path, model, device, config, optimizer=None):
 
 def train(args):
     # 初始化
+    seed_everything(args.seed)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(args.out_dir, timestamp, f"{args.exp_name}")
     logger = setup_logging(log_dir)
@@ -114,6 +135,7 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"使用设备: {device}")
+    logger.info(f"随机种子: {args.seed}")
 
     args.warmup = int(args.warmup * args.epochs)
 
@@ -138,11 +160,25 @@ def train(args):
         frame_interval=args.frame_interval,
     )
 
+    train_generator = torch.Generator().manual_seed(args.seed)
+    val_generator = torch.Generator().manual_seed(args.seed + 1)
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=train_generator,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=val_generator,
     )
 
     # 模型
@@ -255,7 +291,9 @@ def train(args):
         model.train()
         epoch_start = time.time()
 
-        epoch_loss = 0.0
+        epoch_distortion_loss = 0.0
+        epoch_rate_loss = 0.0
+        epoch_total_loss = 0.0
         epoch_psnr = 0.0
         epoch_msssim = 0.0
         samples_seen = 0
@@ -266,8 +304,9 @@ def train(args):
             pixels = batch['pixels'].to(device)
             
             preds = model(coords)
-            image_loss = loss_fn(preds, pixels)
-            total_loss = image_loss
+            distortion_loss = loss_fn(preds, pixels)
+            rate_loss = 0.0  # 基线模型尚无熵约束
+            total_loss = distortion_loss
             batch_size = pixels.size(0)
             
             lr = adjust_lr(
@@ -281,7 +320,9 @@ def train(args):
             psnr = psnr_fn(preds, pixels)
             msssim = msssim_fn(preds, pixels, device)
             
-            epoch_loss += total_loss.item() * batch_size
+            epoch_distortion_loss += distortion_loss.item() * batch_size
+            epoch_rate_loss += rate_loss * batch_size
+            epoch_total_loss += total_loss.item() * batch_size
             epoch_psnr += psnr * batch_size
             epoch_msssim += msssim * batch_size
             samples_seen += batch_size
@@ -293,27 +334,38 @@ def train(args):
                 logging.info(
                     f"epoch [{epoch+1}/{args.epochs}] "
                     f"batch [{batch_idx+1}/{num_train_batches}] "
-                    f"loss: {total_loss.item():.4f} "
-                    f"psnr: {psnr_tmp:.2f} dB  "
-                    f"msssim: {msssim_tmp:.4f}"
+                    f"distortion: {distortion_loss.item():.4f} | "
+                    f"rate: {rate_loss:.4f} | "
+                    f"total: {total_loss.item():.4f} | "
+                    f"psnr: {psnr_tmp:.2f} dB | "
+                    f"msssim: {msssim_tmp:.4f} | "
+                    f"lr: {lr:.3e}"
                 )
         
         # Epoch统计
-        avg_loss = epoch_loss / samples_seen
+        avg_distortion_loss = epoch_distortion_loss / samples_seen
+        avg_rate_loss = epoch_rate_loss / samples_seen
+        avg_total_loss = epoch_total_loss / samples_seen
         avg_psnr = epoch_psnr / samples_seen
         avg_msssim = epoch_msssim / samples_seen
 
         epoch_time = time.time() - epoch_start
         
         # 记录到 TensorBoard
-        tb_writer.add_scalar("train/loss", avg_loss, epoch + 1)
+        tb_writer.add_scalar("train/loss", avg_total_loss, epoch + 1)
+        tb_writer.add_scalar("train/distortion_loss", avg_distortion_loss, epoch + 1)
+        tb_writer.add_scalar("train/rate_loss", avg_rate_loss, epoch + 1)
+        tb_writer.add_scalar("train/total_loss", avg_total_loss, epoch + 1)
         tb_writer.add_scalar("train/psnr", avg_psnr, epoch + 1)
         tb_writer.add_scalar("train/msssim", avg_msssim, epoch + 1)
+        tb_writer.add_scalar("train/lr", lr, epoch + 1)
         tb_writer.add_scalar("time/epoch_sec", epoch_time, epoch + 1)
         
         logging.info(
             f"======  Epoch {epoch+1} 完成 ======"
-            f"LOSS: {avg_loss:.4f} | "
+            f"DISTORTION: {avg_distortion_loss:.4f} | "
+            f"RATE: {avg_rate_loss:.4f} | "
+            f"TOTAL: {avg_total_loss:.4f} | "
             f"PSNR: {avg_psnr:.2f} dB | "
             f"BEST VAL: {best_val_psnr:.2f} dB | "
             f"MSSSIM: {avg_msssim:.4f} | "
@@ -495,6 +547,8 @@ if __name__ == "__main__":
                       help='最大分辨率缩放因子 (default: 1.2)')
     parser.add_argument('--frame_interval', type=int, default=1,
                       help='帧采样间隔 (default: 1)')
+    parser.add_argument('--seed', type=int, default=42,
+                      help='随机种子 (default: 42)')
     
     # 系统参数
     parser.add_argument('--out_dir', type=str, default='./experiments',
