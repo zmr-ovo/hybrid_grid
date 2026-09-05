@@ -69,19 +69,23 @@ def train(args):
     args.warmup = int(args.warmup * args.epochs)
 
     # 数据集
+    fixed_res = tuple(args.fixed_res)
+    if args.dynamic_res and args.batch_size != 1:
+        raise ValueError("dynamic resolution requires batch_size=1")
+
     train_dataset = DynamicVideoDataset(
         data_root=args.data_root,
         base_res=tuple(args.base_res),
-        fixed_res=tuple(args.fixed_res),
+        fixed_res=None if args.dynamic_res else fixed_res,
         min_scale=args.min_scale,
         max_scale=args.max_scale,
-        frame_interval=args.frame_interval
+        frame_interval=args.frame_interval,
     )
 
     val_dataset = DynamicVideoDataset(
         data_root=args.data_root,
         base_res=tuple(args.base_res),
-        fixed_res=tuple(args.fixed_res),
+        fixed_res=fixed_res,
         frame_interval=args.frame_interval,
     )
 
@@ -373,6 +377,8 @@ if __name__ == "__main__":
                     help='运行评估模式（不再训练）')
     parser.add_argument('--fixed_res', type=int, nargs=2, default=[720, 1280],
                         help='评估分辨率 [H W] (default: 720 1280)')
+    parser.add_argument('--dynamic_res', action='store_true',
+                        help='训练时启用动态分辨率（仅支持 batch_size=1）')
 
     # 模型参数
     parser.add_argument('--grid_levels', type=int, default=12,

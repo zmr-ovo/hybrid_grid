@@ -1,19 +1,20 @@
-import os
-import math
+import re
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 from encoding import * 
 
 # --------------------------- 数据集类 ---------------------------
 class DynamicVideoDataset(Dataset):
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+
     def __init__(self, 
                  data_root:str,
                  base_res:Tuple[int, int]=(720, 1280),
@@ -25,24 +26,51 @@ class DynamicVideoDataset(Dataset):
         """支持动态分辨率的视频帧数据集，返回 (coords, pixels) 配对."""
 
         root = Path(data_root)
-        self.frame_paths = sorted(str(p) for p in root.iterdir() if p.is_file())
+        if not root.is_dir():
+            raise ValueError(f"data_root is not a directory: {root}")
+        if frame_interval <= 0:
+            raise ValueError("frame_interval must be positive")
+        if gop_size <= 0:
+            raise ValueError("gop_size must be positive")
+        if min_scale <= 0 or max_scale < min_scale:
+            raise ValueError("scales must satisfy 0 < min_scale <= max_scale")
+        self.base_res = self._validate_resolution('base_res', base_res)
+        self.fixed_res = (
+            self._validate_resolution('fixed_res', fixed_res)
+            if fixed_res is not None else None
+        )
+        self.frame_paths = sorted(
+            (p for p in root.iterdir()
+             if p.is_file() and p.suffix.lower() in self.IMAGE_EXTENSIONS),
+            key=self._natural_sort_key,
+        )
+        if not self.frame_paths:
+            raise ValueError(f"no supported image frames found in: {root}")
+
         self.frame_interval = frame_interval
-        
-        self.base_res = base_res
-        self.fixed_res = fixed_res
         self.min_scale = min_scale
         self.max_scale = max_scale
-        
         self.total_frames = len(self.frame_paths)
-
-        if gop_size <= 0:
-            raise ValueError("gop_size must be positive integer")
+        self.frame_indices = list(range(0, self.total_frames, frame_interval))
         self.gop_size = gop_size
-        
-        self.to_tensor = T.Compose([T.ToTensor()])
+        self.to_tensor = T.ToTensor()
+
+    @staticmethod
+    def _natural_sort_key(path: Path):
+        return [(1, int(part)) if part.isdigit() else (0, part.lower())
+                for part in re.split(r'(\d+)', path.name)]
+
+    @staticmethod
+    def _validate_resolution(name: str, resolution: Tuple[int, int]):
+        if len(resolution) != 2:
+            raise ValueError(f"{name} must contain two positive integers (H, W)")
+        values = tuple(int(value) for value in resolution)
+        if any(value <= 0 for value in values):
+            raise ValueError(f"{name} must contain two positive integers (H, W)")
+        return values
 
     def __len__(self):
-        return int(np.ceil(len(self.frame_paths) / self.frame_interval))
+        return len(self.frame_indices)
     
     def _generate_coords(self, h: int, w: int, t_norm: float, *, device=None, dtype=None):
         """生成归一化到 [0,1] 的 (H,W,3) 坐标网格."""
@@ -60,21 +88,26 @@ class DynamicVideoDataset(Dataset):
             frame_idx: int, 当前样本对应的全局帧号
             gop_id: int, 当前帧所属的 GOP 编号
         """
-        frame_idx = min(idx * self.frame_interval, self.total_frames - 1)
-        img = Image.open(self.frame_paths[frame_idx]).convert("RGB")
+        frame_idx = self.frame_indices[idx]
+        with Image.open(self.frame_paths[frame_idx]) as image:
+            img = image.convert("RGB")
         
         if self.fixed_res is not None:                        
             h, w = self.fixed_res
         else:                                                 
             scale = self.min_scale + (self.max_scale - self.min_scale) * np.random.rand()
-            h = int(self.base_res[0] * scale)
-            w = int(self.base_res[1] * scale)
-            img = T.functional.resize(img, (h, w))
+            h = max(1, int(self.base_res[0] * scale))
+            w = max(1, int(self.base_res[1] * scale))
+
+        img = T.functional.resize(img, (h, w))
 
         img_tensor = self.to_tensor(img)  # (3,H,W) in [0,1]
         
-        t_norm = frame_idx / self.total_frames
+        t_norm = frame_idx / max(self.total_frames - 1, 1)
         coordinates = self._generate_coords(h, w, t_norm, device=img_tensor.device, dtype=img_tensor.dtype)  # (H,W,3) ∈ [0,1]
+
+        if coordinates.shape[:2] != img_tensor.shape[-2:]:
+            raise RuntimeError("coordinate and image resolutions do not match")
         
         gop_id = frame_idx // self.gop_size
 
