@@ -161,7 +161,7 @@ def train(args):
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     loss_fn = NervLoss(loss_type=args.loss_type, device=device)
 
-    data_size = len(train_dataset)
+    num_train_batches = len(train_loader)
 
     # 参数统计
     logging.info("\n" + "="*50 + " 模型结构 " + "="*50)
@@ -222,7 +222,7 @@ def train(args):
         eval_dir = os.path.join(log_dir, "eval")
         os.makedirs(eval_dir, exist_ok=True)
 
-        val_psnr, val_msssim = evaluate(
+        val_psnr, val_msssim, val_fps = evaluate(
             model,
             val_loader,
             device,
@@ -234,7 +234,7 @@ def train(args):
 
         logging.info(
             f"[Eval-only] 验证集结果 → PSNR: {val_psnr:.2f} dB | "
-            f"MS-SSIM: {val_msssim:.4f} ")
+            f"MS-SSIM: {val_msssim:.4f} | FPS: {val_fps:.2f}")
 
         # 同步保存结果到 txt 文件
         result_path = os.path.join(eval_dir, "eval_results.txt")
@@ -243,6 +243,7 @@ def train(args):
             f.write(f"模型路径: {args.resume if getattr(args, 'resume', None) else '当前模型'}\n")
             f.write(f"PSNR: {val_psnr:.2f} dB\n")
             f.write(f"MSSSIM: {val_msssim:.4f}\n")
+            f.write(f"FPS: {val_fps:.2f}\n")
         logging.info(f"评估结果已保存到: {result_path}")
 
         tb_writer.close()
@@ -257,6 +258,7 @@ def train(args):
         epoch_loss = 0.0
         epoch_psnr = 0.0
         epoch_msssim = 0.0
+        samples_seen = 0
         
         for batch_idx, batch in enumerate(train_loader):
             
@@ -266,8 +268,11 @@ def train(args):
             preds = model(coords)
             image_loss = loss_fn(preds, pixels)
             total_loss = image_loss
+            batch_size = pixels.size(0)
             
-            lr = adjust_lr(optimizer, epoch % args.epochs, batch_idx, data_size, args)
+            lr = adjust_lr(
+                optimizer, epoch % args.epochs, batch_idx, num_train_batches, args,
+            )
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -276,26 +281,27 @@ def train(args):
             psnr = psnr_fn(preds, pixels)
             msssim = msssim_fn(preds, pixels, device)
             
-            epoch_loss += total_loss.item()
-            epoch_psnr += psnr
-            epoch_msssim += msssim
+            epoch_loss += total_loss.item() * batch_size
+            epoch_psnr += psnr * batch_size
+            epoch_msssim += msssim * batch_size
+            samples_seen += batch_size
             
             # step日志
-            if batch_idx % args.log_interval == 0 or batch_idx == data_size - 1:
-                psnr_tmp = epoch_psnr / (batch_idx + 1)
-                msssim_tmp = epoch_msssim / (batch_idx + 1)
+            if batch_idx % args.log_interval == 0 or batch_idx == num_train_batches - 1:
+                psnr_tmp = epoch_psnr / samples_seen
+                msssim_tmp = epoch_msssim / samples_seen
                 logging.info(
                     f"epoch [{epoch+1}/{args.epochs}] "
-                    f"batch [{batch_idx+1}/{data_size}] "
+                    f"batch [{batch_idx+1}/{num_train_batches}] "
                     f"loss: {total_loss.item():.4f} "
                     f"psnr: {psnr_tmp:.2f} dB  "
                     f"msssim: {msssim_tmp:.4f}"
                 )
         
         # Epoch统计
-        avg_loss = epoch_loss / data_size
-        avg_psnr = epoch_psnr / data_size
-        avg_msssim = epoch_msssim / data_size
+        avg_loss = epoch_loss / samples_seen
+        avg_psnr = epoch_psnr / samples_seen
+        avg_msssim = epoch_msssim / samples_seen
 
         epoch_time = time.time() - epoch_start
         
@@ -318,7 +324,7 @@ def train(args):
         # evaluate
         if (epoch + 1) % args.eval_freq == 0 or epoch >= args.epochs - 10:
             val_start_time = datetime.now()
-            val_psnr, val_msssim = evaluate(
+            val_psnr, val_msssim, val_fps = evaluate(
                 model,
                 val_loader,
                 device,
@@ -329,6 +335,10 @@ def train(args):
             )
             val_end_time = datetime.now()
             val_time = (val_end_time - val_start_time).total_seconds()
+
+            tb_writer.add_scalar("val/psnr", val_psnr, epoch + 1)
+            tb_writer.add_scalar("val/msssim", val_msssim, epoch + 1)
+            tb_writer.add_scalar("val/fps", val_fps, epoch + 1)
 
             if val_psnr > best_val_psnr:
                 best_val_psnr = val_psnr
@@ -342,6 +352,7 @@ def train(args):
                 f"PSNR: {val_psnr:.2f} dB | "
                 f"BEST: {best_val_psnr:.2f} dB | "
                 f"MSSSIM: {val_msssim:.4f} | "
+                f"FPS: {val_fps:.2f} | "
                 f"TIME: {val_time:.2f}秒 | "
             )
 
@@ -365,7 +376,8 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
              log_interval=50, save_ground_truth=False):
     total_psnr = 0.0
     total_msssim = 0.0
-    time_list = []
+    inference_time = 0.0
+    samples_seen = 0
 
     os.makedirs(save_dir, exist_ok=True) 
 
@@ -374,17 +386,29 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
     for batch_idx, batch in enumerate(val_loader):
         coords = batch['coords'].to(device, non_blocking=True)  # (B,3,H,W)
         pixels = batch['pixels'].to(device, non_blocking=True)  # (B,3,H,W)
-        
-        torch.cuda.synchronize()  
-        start_time = time.time()
+        batch_size = pixels.size(0)
+
+        if batch_idx == 0:
+            model(coords)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
 
         pred = model(coords)
-        time_list.append(time.time() - start_time)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        inference_time += time.perf_counter() - start_time
         
         if dump_images:
-            B = pred.size(0)
-            for i in range(B):
-                sample_id = batch_idx * B + i
+            frame_indices = batch.get('frame_idx')
+            for i in range(batch_size):
+                sample_id = (
+                    int(frame_indices[i])
+                    if frame_indices is not None else samples_seen + i
+                )
 
                 pred_img = pred[i].detach().cpu()
                 save_image(pred_img, os.path.join(save_dir, f'pred_{sample_id:05d}.png'))
@@ -395,14 +419,14 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
 
         psnr = psnr_fn(pred, pixels)
         msssim = msssim_fn(pred, pixels, device)
-        total_psnr += psnr
-        total_msssim += msssim
+        total_psnr += psnr * batch_size
+        total_msssim += msssim * batch_size
+        samples_seen += batch_size
     
         if batch_idx % log_interval == 0 or batch_idx == len(val_loader) - 1:
-
-            fps = (batch_idx + 1) / sum(time_list)            
-            psnr_tmp = total_psnr / (batch_idx + 1)
-            msssim_tmp = total_msssim / (batch_idx + 1)
+            fps = samples_seen / max(inference_time, 1e-12)
+            psnr_tmp = total_psnr / samples_seen
+            msssim_tmp = total_msssim / samples_seen
 
             logging.info(
                 f"Step [{batch_idx + 1}/{len(val_loader)}] | " 
@@ -412,9 +436,10 @@ def evaluate(model, val_loader, device, save_dir='visualize', dump_images=False,
             )
         
     model.train(was_training)
-    avg_psnr = total_psnr / len(val_loader)
-    avg_msssim = total_msssim / len(val_loader)
-    return avg_psnr, avg_msssim
+    avg_psnr = total_psnr / samples_seen
+    avg_msssim = total_msssim / samples_seen
+    fps = samples_seen / max(inference_time, 1e-12)
+    return avg_psnr, avg_msssim, fps
 
 
 if __name__ == "__main__":

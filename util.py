@@ -65,8 +65,9 @@ def psnr_fn(pred:torch.Tensor, target: torch.Tensor) -> float:
     """
     pred = pred.detach()
     target = target.detach()
-    mse = F.mse_loss(pred, target)
-    return 10 * torch.log10(1.0 / mse).item()
+    mse = F.mse_loss(pred, target, reduction='none')
+    mse = mse.flatten(1).mean(dim=1).clamp_min(1e-12)
+    return (10 * torch.log10(1.0 / mse)).mean().item()
 
 
 def msssim_fn(pred: torch.Tensor, target: torch.Tensor, device: torch.device = 'cuda') -> float:
@@ -87,8 +88,8 @@ def msssim_fn(pred: torch.Tensor, target: torch.Tensor, device: torch.device = '
     return ms_ssim_criterion(pred, target).item()
 
 
-def adjust_lr(optimizer, cur_epoch, cur_iter, data_size, args):
-    cur_epoch = cur_epoch + (float(cur_iter) / data_size)
+def adjust_lr(optimizer, cur_epoch, cur_iter, num_batches, args):
+    cur_epoch = cur_epoch + (float(cur_iter) / num_batches)
     if args.lr_type == 'cosine':
         lr_mult = 0.5 * (math.cos(math.pi * (cur_epoch - args.warmup)/ (args.epochs - args.warmup)) + 1.0)
     elif args.lr_type == 'step':

@@ -73,10 +73,9 @@ class CheckpointTest(unittest.TestCase):
 
 
 class EvaluateTest(unittest.TestCase):
-    @patch('train.torch.cuda.synchronize')
     @patch('train.msssim_fn', return_value=0.9)
     @patch('train.psnr_fn', return_value=30.0)
-    def test_evaluate_restores_model_mode(self, _, __, ___):
+    def test_evaluate_restores_model_mode(self, _, __):
         model = nn.Identity()
         model.train()
         batch = {
@@ -85,7 +84,7 @@ class EvaluateTest(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            psnr, msssim = evaluate(
+            psnr, msssim, fps = evaluate(
                 model,
                 [batch],
                 torch.device('cpu'),
@@ -95,7 +94,37 @@ class EvaluateTest(unittest.TestCase):
 
         self.assertEqual(psnr, 30.0)
         self.assertEqual(msssim, 0.9)
+        self.assertGreater(fps, 0.0)
         self.assertTrue(model.training)
+
+    def test_evaluate_weights_partial_batches_by_sample_count(self):
+        model = nn.Identity()
+        batches = [
+            {
+                'coords': torch.zeros(2, 3, 2, 2),
+                'pixels': torch.zeros(2, 3, 2, 2),
+            },
+            {
+                'coords': torch.zeros(1, 3, 2, 2),
+                'pixels': torch.zeros(1, 3, 2, 2),
+            },
+        ]
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch('train.psnr_fn', side_effect=[10.0, 30.0]),
+            patch('train.msssim_fn', side_effect=[0.5, 1.0]),
+        ):
+            psnr, msssim, _ = evaluate(
+                model,
+                batches,
+                torch.device('cpu'),
+                save_dir=temp_dir,
+                log_interval=1,
+            )
+
+        self.assertAlmostEqual(psnr, 50 / 3)
+        self.assertAlmostEqual(msssim, 2 / 3)
 
 
 if __name__ == '__main__':
