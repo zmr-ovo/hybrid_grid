@@ -34,11 +34,13 @@ class CheckpointTest(unittest.TestCase):
             with torch.no_grad():
                 model.weight.fill_(2.0)
 
-            save_checkpoint(model, optimizer, 3, 31.5, make_config(), path)
+            save_checkpoint(
+                model, optimizer, 3, 31.5, 33.0, make_config(), path,
+            )
 
             restored_model = nn.Linear(2, 1)
             restored_optimizer = torch.optim.Adam(restored_model.parameters())
-            start_epoch, best_psnr = load_checkpoint(
+            start_epoch, best_val_psnr, best_train_psnr = load_checkpoint(
                 path,
                 restored_model,
                 torch.device('cpu'),
@@ -47,7 +49,8 @@ class CheckpointTest(unittest.TestCase):
             )
 
             self.assertEqual(start_epoch, 4)
-            self.assertEqual(best_psnr, 31.5)
+            self.assertEqual(best_val_psnr, 31.5)
+            self.assertEqual(best_train_psnr, 33.0)
             self.assertTrue(torch.equal(model.weight, restored_model.weight))
 
     def test_rejects_incompatible_model_config(self):
@@ -55,7 +58,7 @@ class CheckpointTest(unittest.TestCase):
             path = Path(temp_dir) / 'checkpoint.pth'
             model = nn.Linear(2, 1)
             optimizer = torch.optim.Adam(model.parameters())
-            save_checkpoint(model, optimizer, 0, 0.0, make_config(), path)
+            save_checkpoint(model, optimizer, 0, 0.0, 0.0, make_config(), path)
 
             with self.assertRaisesRegex(ValueError, 'hidden_dim'):
                 load_checkpoint(
@@ -65,13 +68,29 @@ class CheckpointTest(unittest.TestCase):
                     make_config(hidden_dim=64),
                 )
 
+    def test_old_checkpoint_defaults_missing_best_train_psnr_to_zero(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'checkpoint.pth'
+            model = nn.Linear(2, 1)
+            optimizer = torch.optim.Adam(model.parameters())
+            save_checkpoint(model, optimizer, 0, 1.0, 2.0, make_config(), path)
+            checkpoint = torch.load(path, map_location='cpu')
+            checkpoint.pop('best_train_psnr')
+            torch.save(checkpoint, path)
+
+            _, _, best_train_psnr = load_checkpoint(
+                path, nn.Linear(2, 1), torch.device('cpu'), make_config(),
+            )
+
+            self.assertEqual(best_train_psnr, 0.0)
+
     def test_rejects_incompatible_model_architecture(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / 'checkpoint.pth'
             model = nn.Linear(2, 1)
             model.architecture = 'experimental'
             optimizer = torch.optim.Adam(model.parameters())
-            save_checkpoint(model, optimizer, 0, 0.0, make_config(), path)
+            save_checkpoint(model, optimizer, 0, 0.0, 0.0, make_config(), path)
 
             restored_model = nn.Linear(2, 1)
             restored_model.architecture = 'hybrid_grid_paper_v1'

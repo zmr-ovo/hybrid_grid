@@ -74,14 +74,17 @@ MODEL_CONFIG_KEYS = (
 )
 
 
-def save_checkpoint(model, optimizer, epoch, best_val_psnr, config, path:str):
+def save_checkpoint(
+    model, optimizer, epoch, best_val_psnr, best_train_psnr, config, path,
+):
     state = {
-        'checkpoint_version': 3,
+        'checkpoint_version': 4,
         'architecture': getattr(model, 'architecture', model.__class__.__name__),
         'epoch': epoch,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'best_val_psnr': best_val_psnr,
+        'best_train_psnr': best_train_psnr,
         'config': dict(vars(config)),
     }
     torch.save(state, path)
@@ -134,7 +137,8 @@ def load_checkpoint(path, model, device, config, optimizer=None):
 
     start_epoch = int(checkpoint.get('epoch', -1)) + 1
     best_val_psnr = float(checkpoint.get('best_val_psnr', 0.0))
-    return start_epoch, best_val_psnr
+    best_train_psnr = float(checkpoint.get('best_train_psnr', 0.0))
+    return start_epoch, best_val_psnr, best_train_psnr
 
 def train(args):
     # 初始化
@@ -249,12 +253,13 @@ def train(args):
     # 加载检查点
     start_epoch = 0
     best_val_psnr = 0.0
+    best_train_psnr = 0.0
 
     if args.eval_only and not args.resume:
         raise ValueError("eval_only requires --resume with a valid checkpoint")
 
     if args.resume:
-        start_epoch, best_val_psnr = load_checkpoint(
+        start_epoch, best_val_psnr, best_train_psnr = load_checkpoint(
             args.resume,
             model,
             device,
@@ -379,6 +384,7 @@ def train(args):
         avg_total_loss = epoch_total_loss / samples_seen
         avg_psnr = epoch_psnr / samples_seen
         avg_msssim = epoch_msssim / samples_seen
+        best_train_psnr = max(best_train_psnr, avg_psnr)
 
         epoch_time = time.time() - epoch_start
         
@@ -388,6 +394,7 @@ def train(args):
         tb_writer.add_scalar("train/rate_loss", avg_rate_loss, epoch + 1)
         tb_writer.add_scalar("train/total_loss", avg_total_loss, epoch + 1)
         tb_writer.add_scalar("train/psnr", avg_psnr, epoch + 1)
+        tb_writer.add_scalar("train/best_psnr", best_train_psnr, epoch + 1)
         tb_writer.add_scalar("train/msssim", avg_msssim, epoch + 1)
         tb_writer.add_scalar("train/lr", lr, epoch + 1)
         tb_writer.add_scalar("time/epoch_sec", epoch_time, epoch + 1)
@@ -398,6 +405,7 @@ def train(args):
             f"RATE: {avg_rate_loss:.4f} | "
             f"TOTAL: {avg_total_loss:.4f} | "
             f"PSNR: {avg_psnr:.2f} dB | "
+            f"BEST TRAIN: {best_train_psnr:.2f} dB | "
             f"BEST VAL: {best_val_psnr:.2f} dB | "
             f"MSSSIM: {avg_msssim:.4f} | "
             f"TIME: {epoch_time:.2f}秒 | "
@@ -426,7 +434,8 @@ def train(args):
                 best_val_psnr = val_psnr
                 best_path = os.path.join(log_dir, 'train_best.pth')
                 save_checkpoint(
-                    model, optimizer, epoch, best_val_psnr, args, best_path,
+                    model, optimizer, epoch, best_val_psnr, best_train_psnr,
+                    args, best_path,
                 )
 
             logging.info(
@@ -440,7 +449,8 @@ def train(args):
         if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
             checkpoint_path = os.path.join(log_dir, 'train_latest.pth')
             save_checkpoint(
-                model, optimizer, epoch, best_val_psnr, args, checkpoint_path,
+                model, optimizer, epoch, best_val_psnr, best_train_psnr,
+                args, checkpoint_path,
             )
     total_time = time.time() - train_start_time
     hours = int(total_time // 3600)
