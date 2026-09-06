@@ -124,18 +124,16 @@ class EvaluateTest(unittest.TestCase):
             },
         ]
 
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch('train.psnr_fn', side_effect=[10.0, 30.0]),
-            patch('train.msssim_fn', side_effect=[0.5, 1.0]),
-        ):
-            psnr, msssim = evaluate(
-                model,
-                batches,
-                torch.device('cpu'),
-                save_dir=temp_dir,
-                log_interval=1,
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch('train.psnr_fn', side_effect=[10.0, 30.0]), \
+                    patch('train.msssim_fn', side_effect=[0.5, 1.0]):
+                psnr, msssim = evaluate(
+                    model,
+                    batches,
+                    torch.device('cpu'),
+                    save_dir=temp_dir,
+                    log_interval=1,
+                )
 
         self.assertAlmostEqual(psnr, 50 / 3)
         self.assertAlmostEqual(msssim, 2 / 3)

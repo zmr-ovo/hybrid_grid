@@ -233,16 +233,18 @@ class HybridGridNet(nn.Module):
             skip_layer=2,
         )
         
-    def forward(self, coords):
+    def forward(self, coords, grids=None):
         """
-        Args: coords (B,3,H,W) 归一化坐标[x,y,t] ∈ [0,1]
+        Args:
+            coords: (B,3,H,W) 归一化坐标 [x,y,t] ∈ [0,1]
+            grids: 可选的外部 Grid 序列；默认使用模型内部参数。
         Return: (B,3,H,W)
         """
         b, _, h, w = coords.shape
         coords_hw = coords.permute(0, 2, 3, 1)  # (B,H,W,3)
 
         # 特征编码
-        grid_feat = self.grid_encoder(coords_hw)   # (B,H,W,L*C)
+        grid_feat = self.grid_encoder(coords_hw, grids=grids)  # (B,H,W,L*C)
         pe_feat   = self.pe_encoder(coords_hw)     # (B,H,W,pe_dim)
 
         # 门控

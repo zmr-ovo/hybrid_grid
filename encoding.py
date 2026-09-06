@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from typing import Tuple, Dict
+from typing import Dict, Optional, Sequence, Tuple
 
 
 class Frequency(nn.Module):
@@ -72,8 +72,23 @@ class SingleResGrid(nn.Module):
         interp_mask = (corner_idx & (1 << dims)) == 0     # (8,3) bool
         self.register_buffer("interp_mask", interp_mask, persistent=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, grid: Optional[torch.Tensor] = None):
         # x: (..., 3), [x,y,t] ∈ [0,1]
+        if grid is None:
+            grid = self.grid
+        elif not torch.is_tensor(grid):
+            raise TypeError("grid must be a torch.Tensor")
+        elif grid.shape != self.grid.shape:
+            raise ValueError(
+                f"grid shape must be {tuple(self.grid.shape)}, got {tuple(grid.shape)}"
+            )
+        elif grid.device != x.device:
+            raise ValueError("grid and coordinates must be on the same device")
+        elif grid.dtype != self.grid.dtype:
+            raise ValueError(
+                f"grid dtype must be {self.grid.dtype}, got {grid.dtype}"
+            )
+
         bdims = x.shape[:-1]
 
         # 映射到网格坐标
@@ -109,7 +124,7 @@ class SingleResGrid(nn.Module):
         w = ws.prod(dim=-1, keepdim=True)                  # (..., 8, 1)
 
         # 从网格中取值（高级索引）
-        neig = self.grid[inds[..., 0], inds[..., 1], inds[..., 2]]  # (..., 8, C)
+        neig = grid[inds[..., 0], inds[..., 1], inds[..., 2]]  # (..., 8, C)
 
         # 加权求和
         return torch.sum(neig * w, dim=-2)                 # (..., C)
@@ -155,6 +170,21 @@ class MultiResGrid(nn.Module):
         self.input_dim = 3
         self.output_dim = n_levels * n_features_per_level
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        grids: Optional[Sequence[torch.Tensor]] = None,
+    ):
         # x: (..., 3) in [0,1]
-        return torch.cat([level(x) for level in self.levels], dim=-1)
+        if grids is None:
+            return torch.cat([level(x) for level in self.levels], dim=-1)
+        if not isinstance(grids, (list, tuple)):
+            raise TypeError("grids must be a list or tuple of tensors")
+        if len(grids) != self.n_levels:
+            raise ValueError(
+                f"expected {self.n_levels} grids, got {len(grids)}"
+            )
+
+        return torch.cat([
+            level(x, grid=grid) for level, grid in zip(self.levels, grids)
+        ], dim=-1)

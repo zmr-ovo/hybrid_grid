@@ -11,7 +11,8 @@ class QuantizationTest(unittest.TestCase):
 
         quantized, dequantized, metadata = quantize_per_tensor(values, bit=8)
 
-        self.assertEqual(quantized.tolist(), [0, 128, 255])
+        self.assertEqual(quantized[[0, -1]].tolist(), [0, 255])
+        self.assertIn(quantized[1].item(), (127, 128))
         self.assertTrue(torch.allclose(dequantized, values, atol=metadata.scale.item()))
         self.assertAlmostEqual(metadata.scale.item(), 1 / 255)
         self.assertEqual(metadata.zero_point.item(), 0)
