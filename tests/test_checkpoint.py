@@ -65,6 +65,21 @@ class CheckpointTest(unittest.TestCase):
                     make_config(hidden_dim=64),
                 )
 
+    def test_rejects_incompatible_model_architecture(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'checkpoint.pth'
+            model = nn.Linear(2, 1)
+            model.architecture = 'experimental'
+            optimizer = torch.optim.Adam(model.parameters())
+            save_checkpoint(model, optimizer, 0, 0.0, make_config(), path)
+
+            restored_model = nn.Linear(2, 1)
+            restored_model.architecture = 'hybrid_grid_paper_v1'
+            with self.assertRaisesRegex(ValueError, '模型架构与检查点不一致'):
+                load_checkpoint(
+                    path, restored_model, torch.device('cpu'), make_config(),
+                )
+
     def test_missing_checkpoint_fails(self):
         with self.assertRaises(FileNotFoundError):
             load_checkpoint(

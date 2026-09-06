@@ -118,8 +118,8 @@ class DynamicVideoDataset(Dataset):
             'gop_id': gop_id
         }
 
-# --------------------------- 解码器模块 0 --------------------------
-class DecoderOri(nn.Module):
+# --------------------------- 解码器模块 ---------------------------
+class Decoder(nn.Module):
     def __init__(self, input_dim, hidden_dim=256, skip_layer=2):
         super().__init__()
         self.input_dim = input_dim
@@ -153,92 +153,7 @@ class DecoderOri(nn.Module):
             
         return self.output_layer(h)
 
-# --------------------------- 解码器模块 new --------------------------
-class Decoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 256, skip_layer: int = 2,
-                 refine_channels: int = 32, refine_blocks: int = 3):
-        """
-        MLP + Residual CNN refine 的解码器：
-          - 先用 MLP 把 (B*H*W, D) -> (B*H*W, 3) 得到 coarse 结果
-          - 再把 coarse reshape成 (B,3,H,W)，经过一个小 CNN 得到 refine
-          - 最终输出 out = coarse + refine
-
-        Args:
-            input_dim: MLP 输入维度 (与原来一致)
-            hidden_dim: MLP 隐层维度
-            skip_layer: 使用 skip connection 的层索引（与原来一致）
-            refine_channels: 小 CNN 中间通道数
-            refine_blocks: refine 里 Conv block 的层数（>=2 比较合适）
-        """
-        super().__init__()
-        self.input_dim = input_dim
-        self.skip_layer = skip_layer
-
-        # --------- 原来的 MLP 部分（几乎不动） ---------
-        self.layers = nn.ModuleList([
-            nn.Linear(input_dim, hidden_dim),              # 0
-            nn.Linear(hidden_dim, hidden_dim),             # 1
-            nn.Linear(hidden_dim + input_dim, hidden_dim), # 2 (skip 连接)
-            nn.Linear(hidden_dim, hidden_dim // 2)         # 3
-        ])
-
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim // 2, 3),
-            nn.Sigmoid()   # coarse RGB ∈ [0,1]
-        )
-
-        self.act = nn.GELU()
-
-        # --------- 新增：小 CNN refine 模块 ---------
-        blocks = []
-        in_ch = 3
-        ch = refine_channels
-
-        # 第一个 conv，把 3 通道提到 ch
-        blocks.append(nn.Conv2d(in_ch, ch, kernel_size=3, padding=1))
-        blocks.append(nn.ReLU(inplace=True))
-
-        # 中间 conv blocks
-        for _ in range(refine_blocks - 2):
-            blocks.append(nn.Conv2d(ch, ch, kernel_size=3, padding=1))
-            blocks.append(nn.ReLU(inplace=True))
-
-        # 最后一层把通道数降回 3，作为 residual
-        blocks.append(nn.Conv2d(ch, 3, kernel_size=3, padding=1))
-
-        self.refine = nn.Sequential(*blocks)
-
-    def forward(self, x: torch.Tensor, b: int, h: int, w: int) -> torch.Tensor:
-        """
-        Args:
-            x: (B*H*W, D) 解码器输入特征
-            b, h, w: 当前 batch 的 B, H, W，用于 reshape
-
-        Return:
-            out: (B,3,H,W)
-        """
-        # ------- 1) MLP 解码，得到 coarse RGB -------
-        h_feat = x  # (B*H*W, D)
-        for i, layer in enumerate(self.layers):
-            if i == self.skip_layer:
-                # skip 连接：在指定层把原始输入拼回来
-                h_feat = torch.cat([x, h_feat], dim=-1)
-            h_feat = layer(h_feat)
-            h_feat = self.act(h_feat)
-
-        coarse_flat = self.output_layer(h_feat)           # (B*H*W, 3)
-        coarse = coarse_flat.view(b, h, w, 3).permute(0, 3, 1, 2)  # (B,3,H,W)
-
-        # ------- 2) 小 CNN refine -------
-        refine = self.refine(coarse)                      # (B,3,H,W)
-        out = coarse + refine                             # 残差相加
-
-        # 可选：保证输出在 [0,1] 范围内
-        out = out.clamp(0.0, 1.0)
-
-        return out  # (B,3,H,W)
-
-# --------------------------- 调制模块0 ---------------------------
+# --------------------------- 时间调制模块 -------------------------
 class TemporalModulation(nn.Module):
     def __init__(self, input_dim:int, hidden_dim:int=64):
         super().__init__()
@@ -269,48 +184,10 @@ class TemporalModulation(nn.Module):
 
         return x_norm * gamma + beta
 
-# --------------------------- 调制模块new ---------------------------
-class SpatioTemporalModulation(nn.Module):
-    def __init__(self, input_dim:int, hidden_dim:int=64):
-        """
-        input_dim: 特征通道数 C
-        hidden_dim: 用于从 [x,y,t] 生成 gamma/beta 的中间通道数
-        """
-        super().__init__()
-
-        # 输入: coords [B, 3, H, W]
-        # 输出: gamma_beta [B, 2C, H, W]，前 C 个通道是 γ，后 C 个通道是 β
-        self.coord_to_gamma_beta = nn.Sequential(
-            nn.Conv2d(3, hidden_dim, kernel_size=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, input_dim * 2, kernel_size=1, padding=0)
-        )
-        self.norm = nn.GroupNorm(input_dim, input_dim, affine=False)
-
-        last_conv = self.coord_to_gamma_beta[-1]
-        nn.init.zeros_(last_conv.weight)
-        if last_conv.bias is not None:
-            nn.init.zeros_(last_conv.bias)
-
-    def forward(self, x: torch.Tensor, coords: torch.Tensor):
-        """
-        x:      [B, C, H, W]
-        coords: [B, 3, H, W]，归一化后的坐标 [x, y, t]
-        """
-        b, c, h, w = x.shape
-
-        gamma_beta = self.coord_to_gamma_beta(coords)  # [B, 2C, H, W]
-        gamma, beta = gamma_beta.chunk(2, dim=1)       # [B,C,H,W], [B,C,H,W]
-
-        x_norm = self.norm(x)
-
-        gamma = 1.0 + gamma
-
-        out = x_norm * gamma + beta
-        return out
-
 # --------------------------- 模型架构 ---------------------------
 class HybridGridNet(nn.Module):
+    architecture = "hybrid_grid_paper_v1"
+
     def __init__(self,
                  grid_levels: int = 6,
                  grid_feat_dim: int = 4,
@@ -332,7 +209,7 @@ class HybridGridNet(nn.Module):
             aspect_ratio=aspect_ratio,
             time_scale=time_scale
         )
-        self.pe_encoder = Frequency(dim=3, n_levels=pe_freq)
+        self.pe_encoder = Frequency(dim=3, n_levels=pe_freq, base=2.0)
         
         decoder_input_dim = self.grid_encoder.output_dim + self.pe_encoder.output_dim  
 
@@ -347,14 +224,13 @@ class HybridGridNet(nn.Module):
         )
         
         # 时间调制
-        self.time_mod = SpatioTemporalModulation(input_dim=decoder_input_dim, hidden_dim=64)
+        self.time_mod = TemporalModulation(input_dim=decoder_input_dim, hidden_dim=64)
     
         # 解码器
         self.decoder = Decoder(
-            input_dim=decoder_input_dim, 
+            input_dim=decoder_input_dim,
             hidden_dim=hidden_dim,
             skip_layer=2,
-            refine_channels=32
         )
         
     def forward(self, coords):
@@ -381,8 +257,7 @@ class HybridGridNet(nn.Module):
             coords                             # [B,3,H,W]
         ).permute(0, 2, 3, 1)                 # (B,H,W,D)
 
-        # 解码：先 flatten，再交给 Decoder，同时传 b,h,w
-        modulated_flat = modulated_feat.reshape(b * h * w, -1)    # (B*H*W,D)
-        out = self.decoder(modulated_flat, b, h, w)               # (B,3,H,W)
-
-        return out
+        # 解码：先 flatten，经 MLP 输出 RGB，再恢复图像布局
+        modulated_flat = modulated_feat.reshape(b * h * w, -1)
+        rgb = self.decoder(modulated_flat)
+        return rgb.view(b, h, w, 3).permute(0, 3, 1, 2)

@@ -76,7 +76,8 @@ MODEL_CONFIG_KEYS = (
 
 def save_checkpoint(model, optimizer, epoch, best_val_psnr, config, path:str):
     state = {
-        'checkpoint_version': 2,
+        'checkpoint_version': 3,
+        'architecture': getattr(model, 'architecture', model.__class__.__name__),
         'epoch': epoch,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -114,6 +115,15 @@ def load_checkpoint(path, model, device, config, optimizer=None):
         raise FileNotFoundError(f"未找到检查点: {path}")
 
     checkpoint = torch.load(path, map_location=device)
+    saved_architecture = checkpoint.get('architecture')
+    current_architecture = getattr(model, 'architecture', model.__class__.__name__)
+    if saved_architecture is None:
+        logging.warning("检查点未保存模型架构标识，将由 state_dict 验证兼容性")
+    elif saved_architecture != current_architecture:
+        raise ValueError(
+            f"模型架构与检查点不一致: checkpoint={saved_architecture}, "
+            f"current={current_architecture}"
+        )
     _validate_model_config(checkpoint.get('config'), config)
     model.load_state_dict(checkpoint['state_dict'])
 

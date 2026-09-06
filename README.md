@@ -21,6 +21,8 @@
 - **Gate Layer：** 对 Grid Features 与 Positional Embeddings 进行自适应加权融合。
 - **Time-Aware Modulation (TAM)：** 根据时间信息生成调制参数，对融合特征进行动态调整后交由轻量 MLP 解码为 RGB 帧。
 
+仓库只保留论文使用的模型结构：可学习位置编码以 `2^m` 初始化，TAM 仅由时间坐标驱动，Decoder 为纯 MLP，不包含后续尝试中的 CNN refine 或逐像素时空调制。
+
 论文同时采用 entropy bottlenecks 对 grid latent features 进行压缩，以支持码率控制与率失真评测。
 
 ---
