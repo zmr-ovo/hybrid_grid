@@ -6,8 +6,10 @@ from pathlib import Path
 import torch
 
 from compression.model import CompressedHybridGridNet
+from compression.rate import estimate_fp32_rate
 from model import HybridGridNet
 from train_compression import (
+    _model_storage,
     compression_stage,
     load_compression_checkpoint,
     rate_distortion_loss,
@@ -114,6 +116,46 @@ class RateDistortionLossTest(unittest.TestCase):
         expected = distortion + 1e-3 * output.rate.bits_per_value
         self.assertTrue(torch.equal(rate, output.rate.bits_per_value))
         self.assertTrue(torch.equal(total, expected))
+
+    def test_storage_rate_excludes_grid_from_fp32_network_bits(self):
+        model = make_model()
+        non_grid, entropy = _model_storage(model)
+        grid_parameters = sum(
+            level.grid.numel()
+            for level in model.reconstruction_model.grid_encoder.levels
+        )
+        reconstruction_parameters = sum(
+            parameter.numel()
+            for parameter in model.reconstruction_model.parameters()
+        )
+
+        self.assertEqual(
+            non_grid.parameter_count,
+            reconstruction_parameters - grid_parameters,
+        )
+        self.assertEqual(
+            entropy.parameter_count,
+            sum(parameter.numel() for parameter in model.entropy_models.parameters()),
+        )
+
+        output = model(torch.rand(1, 3, 2, 2), quant_mode='symbols')
+        summary = estimate_fp32_rate(
+            1000,
+            non_grid,
+            entropy,
+            output.rate.total_bits.item(),
+            output.rate.bits_per_value.item(),
+        )
+        self.assertAlmostEqual(
+            summary.estimated_grid_bits,
+            output.rate.total_bits.item(),
+        )
+        self.assertEqual(
+            summary.estimated_payload_bits,
+            summary.estimated_grid_bits
+            + non_grid.total_bits
+            + entropy.total_bits,
+        )
 
 
 class CompressionCheckpointTest(unittest.TestCase):

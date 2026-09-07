@@ -6,6 +6,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -14,6 +15,11 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
 from compression.model import CompressedHybridGridNet
+from compression.rate import (
+    Fp32RateBreakdown,
+    estimate_fp32_rate,
+    parameter_storage,
+)
 from model import DynamicVideoDataset, HybridGridNet
 from train import seed_everything, seed_worker, setup_logging
 from util import NervLoss, msssim_fn, psnr_fn
@@ -30,6 +36,14 @@ CHECKPOINT_CONFIG_KEYS = (
 class CompressionStage:
     quant_mode: str
     lambda_rate: float
+
+
+@dataclass(frozen=True)
+class CompressionEvaluation:
+    psnr: float
+    msssim: float
+    rate: Fp32RateBreakdown
+    level_bits: Tuple[float, ...]
 
 
 def compression_stage(
@@ -77,6 +91,121 @@ def rate_distortion_loss(distortion, output, lambda_rate):
     else:
         rate = output.rate.bits_per_value
     return distortion + lambda_rate * rate, rate
+
+
+def _model_storage(model):
+    grid_parameter_ids = {
+        id(level.grid)
+        for level in model.reconstruction_model.grid_encoder.levels
+    }
+    non_grid_parameters = (
+        parameter
+        for parameter in model.reconstruction_model.parameters()
+        if id(parameter) not in grid_parameter_ids
+    )
+    return (
+        parameter_storage(non_grid_parameters, required_dtype=torch.float32),
+        parameter_storage(
+            model.entropy_models.parameters(), required_dtype=torch.float32,
+        ),
+    )
+
+
+def _averaged_rate_summary(grid_bits_sum, rate_sum, samples_seen,
+                           total_video_pixels, non_grid_storage,
+                           entropy_model_storage):
+    if grid_bits_sum is None:
+        return estimate_fp32_rate(
+            total_video_pixels,
+            non_grid_storage,
+            entropy_model_storage,
+        )
+    return estimate_fp32_rate(
+        total_video_pixels,
+        non_grid_storage,
+        entropy_model_storage,
+        grid_bits=grid_bits_sum / samples_seen,
+        legacy_rate_per_value=rate_sum / samples_seen,
+    )
+
+
+def _mib(bits):
+    return bits / 8 / 1024 ** 2
+
+
+def _log_rate_summary(logger, prefix, summary, level_bits=()):
+    non_grid = summary.non_grid_storage
+    entropy = summary.entropy_model_storage
+    logger.info(
+        "%s BIT | video pixels: %d | non-Grid FP32: %d tensors, %d params, "
+        "%d bits (%.4f MiB, %.6f BPP) | entropy side FP32: %d tensors, "
+        "%d params, %d bits (%.4f MiB, %.6f BPP)",
+        prefix,
+        summary.total_video_pixels,
+        non_grid.tensor_count,
+        non_grid.parameter_count,
+        non_grid.total_bits,
+        _mib(non_grid.total_bits),
+        summary.non_grid_bpp,
+        entropy.tensor_count,
+        entropy.parameter_count,
+        entropy.total_bits,
+        _mib(entropy.total_bits),
+        summary.entropy_model_side_info_bpp,
+    )
+    if summary.estimated_grid_bits is None:
+        logger.info(
+            "%s BIT | Grid: N/A (quantization disabled) | estimated payload: "
+            "N/A | quantization/bitstream metadata: NOT INCLUDED",
+            prefix,
+        )
+        return
+
+    logger.info(
+        "%s BIT | legacy rate/value: %.4f | Grid: %.0f bits "
+        "(%.4f MiB, %.6f BPP) | estimated payload subtotal: %.0f bits "
+        "(%.4f MiB, %.6f BPP) | metadata: NOT INCLUDED",
+        prefix,
+        summary.legacy_rate_per_value,
+        summary.estimated_grid_bits,
+        _mib(summary.estimated_grid_bits),
+        summary.estimated_grid_bpp,
+        summary.estimated_payload_bits,
+        _mib(summary.estimated_payload_bits),
+        summary.estimated_payload_bpp,
+    )
+    if level_bits:
+        logger.info(
+            "%s GRID LEVEL BITS | %s",
+            prefix,
+            ' | '.join(
+                'L{}: {:.0f}'.format(index, bits)
+                for index, bits in enumerate(level_bits)
+            ),
+        )
+
+
+def _write_rate_summary(writer, prefix, summary, level_bits, step):
+    scalars = {
+        'non_grid_fp32_bits': summary.non_grid_storage.total_bits,
+        'non_grid_fp32_bpp': summary.non_grid_bpp,
+        'entropy_model_fp32_bits': summary.entropy_model_storage.total_bits,
+        'entropy_model_fp32_bpp': summary.entropy_model_side_info_bpp,
+    }
+    if summary.estimated_grid_bits is not None:
+        scalars.update({
+            'legacy_rate_per_value': summary.legacy_rate_per_value,
+            'estimated_grid_bits': summary.estimated_grid_bits,
+            'estimated_grid_bpp': summary.estimated_grid_bpp,
+            'estimated_payload_bits': summary.estimated_payload_bits,
+            'estimated_payload_bpp': summary.estimated_payload_bpp,
+        })
+    for name, value in scalars.items():
+        writer.add_scalar(prefix + '/' + name, value, step)
+    for index, bits in enumerate(level_bits):
+        writer.add_scalar(
+            prefix + '/grid_level_{}_bits'.format(index), bits, step,
+        )
 
 
 def set_cosine_learning_rate(optimizer, base_lr, epoch, batch_index,
@@ -183,13 +312,16 @@ def load_compression_checkpoint(path, model, optimizer, device, config):
 
 
 @torch.no_grad()
-def evaluate_compression(model, loader, device, quant_mode, save_dir=None,
+def evaluate_compression(model, loader, device, quant_mode, total_video_pixels,
+                         non_grid_storage, entropy_model_storage, save_dir=None,
                          dump_images=False, log_interval=50):
     was_training = model.training
     model.eval()
     total_psnr = 0.0
     total_msssim = 0.0
     total_rate = 0.0
+    grid_bits_sum = None
+    level_bits_sum = None
     samples_seen = 0
 
     if dump_images:
@@ -207,6 +339,13 @@ def evaluate_compression(model, loader, device, quant_mode, save_dir=None,
         total_psnr += psnr * batch_size
         total_msssim += msssim * batch_size
         total_rate += rate * batch_size
+        if output.rate is not None:
+            if grid_bits_sum is None:
+                grid_bits_sum = 0.0
+                level_bits_sum = [0.0] * len(output.rate.level_bits)
+            grid_bits_sum += output.rate.total_bits.item() * batch_size
+            for index, bits in enumerate(output.rate.level_bits):
+                level_bits_sum[index] += bits.item() * batch_size
 
         if dump_images:
             frame_indices = batch.get('frame_idx')
@@ -233,10 +372,23 @@ def evaluate_compression(model, loader, device, quant_mode, save_dir=None,
             )
 
     model.train(was_training)
-    return (
-        total_psnr / samples_seen,
-        total_msssim / samples_seen,
-        total_rate / samples_seen,
+    summary = _averaged_rate_summary(
+        grid_bits_sum,
+        total_rate,
+        samples_seen,
+        total_video_pixels,
+        non_grid_storage,
+        entropy_model_storage,
+    )
+    level_bits = (
+        () if level_bits_sum is None
+        else tuple(bits / samples_seen for bits in level_bits_sum)
+    )
+    return CompressionEvaluation(
+        psnr=total_psnr / samples_seen,
+        msssim=total_msssim / samples_seen,
+        rate=summary,
+        level_bits=level_bits,
     )
 
 
@@ -331,6 +483,10 @@ def train_compression(args):
 
     train_loader, val_loader, train_generator = _make_loaders(args)
     model = _make_model(args, device)
+    total_video_pixels = (
+        len(val_loader.dataset) * args.fixed_res[0] * args.fixed_res[1]
+    )
+    non_grid_storage, entropy_model_storage = _model_storage(model)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
@@ -345,6 +501,12 @@ def train_compression(args):
     logger.info("压缩模型参数: %d", total_params)
     logger.info("重建模型参数: %d", reconstruction_params)
     logger.info("熵模型参数: %d", entropy_params)
+    initial_rate = estimate_fp32_rate(
+        total_video_pixels,
+        non_grid_storage,
+        entropy_model_storage,
+    )
+    _log_rate_summary(logger, 'MODEL', initial_rate)
     for key, value in vars(args).items():
         logger.info("%s: %s", key, value)
 
@@ -376,6 +538,8 @@ def train_compression(args):
         total_sum = 0.0
         psnr_sum = 0.0
         msssim_sum = 0.0
+        grid_bits_sum = None
+        level_bits_sum = None
         samples_seen = 0
 
         for batch_index, batch in enumerate(train_loader):
@@ -404,6 +568,13 @@ def train_compression(args):
             msssim = msssim_fn(output.reconstruction, pixels, device)
             distortion_sum += distortion.item() * batch_size
             rate_sum += rate.item() * batch_size
+            if output.rate is not None:
+                if grid_bits_sum is None:
+                    grid_bits_sum = 0.0
+                    level_bits_sum = [0.0] * len(output.rate.level_bits)
+                grid_bits_sum += output.rate.total_bits.item() * batch_size
+                for index, bits in enumerate(output.rate.level_bits):
+                    level_bits_sum[index] += bits.item() * batch_size
             total_sum += total_loss.item() * batch_size
             psnr_sum += psnr * batch_size
             msssim_sum += msssim * batch_size
@@ -433,6 +604,18 @@ def train_compression(args):
         avg_total = total_sum / samples_seen
         avg_psnr = psnr_sum / samples_seen
         avg_msssim = msssim_sum / samples_seen
+        epoch_rate = _averaged_rate_summary(
+            grid_bits_sum,
+            rate_sum,
+            samples_seen,
+            total_video_pixels,
+            non_grid_storage,
+            entropy_model_storage,
+        )
+        level_bits = (
+            () if level_bits_sum is None
+            else tuple(bits / samples_seen for bits in level_bits_sum)
+        )
         best_train_psnr = max(best_train_psnr, avg_psnr)
         epoch_seconds = time.time() - epoch_start
 
@@ -451,6 +634,7 @@ def train_compression(args):
             epoch + 1,
         )
         writer.add_scalar('time/epoch_sec', epoch_seconds, epoch + 1)
+        _write_rate_summary(writer, 'train_rate', epoch_rate, level_bits, epoch + 1)
         logger.info(
             "Epoch %d | mode: %s | lambda: %.3e | distortion: %.6f | "
             "rate/value: %.4f | total: %.6f | PSNR: %.2f dB | "
@@ -466,34 +650,49 @@ def train_compression(args):
             avg_msssim,
             epoch_seconds,
         )
+        _log_rate_summary(logger, 'Train epoch', epoch_rate, level_bits)
 
         if (epoch + 1) % args.eval_freq == 0 or epoch >= args.epochs - 10:
             evaluation_mode = (
                 'disabled' if stage.quant_mode == 'disabled' else 'symbols'
             )
-            val_psnr, val_msssim, val_rate = evaluate_compression(
+            evaluation = evaluate_compression(
                 model,
                 val_loader,
                 device,
                 evaluation_mode,
+                total_video_pixels,
+                non_grid_storage,
+                entropy_model_storage,
                 save_dir=os.path.join(log_dir, 'visualize'),
                 dump_images=args.dump_images,
                 log_interval=args.log_interval,
             )
-            writer.add_scalar('val/psnr', val_psnr, epoch + 1)
-            writer.add_scalar('val/msssim', val_msssim, epoch + 1)
-            writer.add_scalar('val/rate_per_value', val_rate, epoch + 1)
+            writer.add_scalar('val/psnr', evaluation.psnr, epoch + 1)
+            writer.add_scalar('val/msssim', evaluation.msssim, epoch + 1)
+            _write_rate_summary(
+                writer,
+                'val_rate',
+                evaluation.rate,
+                evaluation.level_bits,
+                epoch + 1,
+            )
             logger.info(
                 "Val epoch %d | mode: %s | PSNR: %.2f dB | "
                 "MS-SSIM: %.4f | rate/value: %.4f",
                 epoch + 1,
                 evaluation_mode,
-                val_psnr,
-                val_msssim,
-                val_rate,
+                evaluation.psnr,
+                evaluation.msssim,
+                0.0 if evaluation.rate.legacy_rate_per_value is None
+                else evaluation.rate.legacy_rate_per_value,
             )
-            if evaluation_mode == 'symbols' and val_psnr > best_val_psnr:
-                best_val_psnr = val_psnr
+            _log_rate_summary(
+                logger, 'Val epoch', evaluation.rate, evaluation.level_bits,
+            )
+            if (evaluation_mode == 'symbols' and
+                    evaluation.psnr > best_val_psnr):
+                best_val_psnr = evaluation.psnr
                 save_compression_checkpoint(
                     model,
                     optimizer,

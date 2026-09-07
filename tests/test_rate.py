@@ -1,8 +1,13 @@
 import unittest
 
 import torch
+from torch import nn
 
-from compression.rate import estimate_grid_rate
+from compression.rate import (
+    estimate_fp32_rate,
+    estimate_grid_rate,
+    parameter_storage,
+)
 
 
 class GridRateTest(unittest.TestCase):
@@ -73,6 +78,81 @@ class GridRateTest(unittest.TestCase):
                     estimate_grid_rate([torch.tensor([0.5])], bound)
         with self.assertRaises(TypeError):
             estimate_grid_rate([torch.tensor([0.5])], True)
+
+
+class ParameterStorageTest(unittest.TestCase):
+    def test_counts_real_fp32_storage_without_duplicates(self):
+        weight = nn.Parameter(torch.zeros(2, 3))
+        bias = nn.Parameter(torch.zeros(2))
+
+        result = parameter_storage(
+            [weight, bias, weight], required_dtype=torch.float32,
+        )
+
+        self.assertEqual(result.tensor_count, 2)
+        self.assertEqual(result.parameter_count, 8)
+        self.assertEqual(result.total_bits, 8 * 32)
+        self.assertEqual(result.bits_by_dtype, (('float32', 8 * 32),))
+
+    def test_required_fp32_rejects_other_dtypes(self):
+        parameter = nn.Parameter(torch.zeros(2, dtype=torch.float64))
+
+        with self.assertRaisesRegex(ValueError, 'float32'):
+            parameter_storage([parameter], required_dtype=torch.float32)
+
+
+class Fp32RateBreakdownTest(unittest.TestCase):
+    def setUp(self):
+        self.non_grid = parameter_storage([
+            nn.Parameter(torch.zeros(10)),
+        ], required_dtype=torch.float32)
+        self.entropy = parameter_storage([
+            nn.Parameter(torch.zeros(2)),
+        ], required_dtype=torch.float32)
+
+    def test_reports_each_rate_component_and_payload_subtotal(self):
+        result = estimate_fp32_rate(
+            total_video_pixels=100,
+            non_grid_storage=self.non_grid,
+            entropy_model_storage=self.entropy,
+            grid_bits=400,
+            legacy_rate_per_value=2.0,
+        )
+
+        self.assertEqual(result.estimated_grid_bits, 400)
+        self.assertEqual(result.estimated_grid_bpp, 4.0)
+        self.assertEqual(result.non_grid_storage.total_bits, 320)
+        self.assertEqual(result.non_grid_bpp, 3.2)
+        self.assertEqual(result.entropy_model_storage.total_bits, 64)
+        self.assertEqual(result.entropy_model_side_info_bpp, 0.64)
+        self.assertEqual(result.estimated_payload_bits, 784)
+        self.assertEqual(result.estimated_payload_bpp, 7.84)
+        self.assertFalse(result.metadata_included)
+
+    def test_disabled_grid_rate_is_not_reported_as_zero(self):
+        result = estimate_fp32_rate(
+            total_video_pixels=100,
+            non_grid_storage=self.non_grid,
+            entropy_model_storage=self.entropy,
+        )
+
+        self.assertIsNone(result.legacy_rate_per_value)
+        self.assertIsNone(result.estimated_grid_bits)
+        self.assertIsNone(result.estimated_grid_bpp)
+        self.assertIsNone(result.estimated_payload_bits)
+        self.assertIsNone(result.estimated_payload_bpp)
+        self.assertEqual(result.non_grid_bpp, 3.2)
+
+    def test_bpp_depends_on_sequence_pixels_not_batch_size(self):
+        first = estimate_fp32_rate(
+            100, self.non_grid, self.entropy, 400, 2.0,
+        )
+        second = estimate_fp32_rate(
+            100, self.non_grid, self.entropy, 400, 2.0,
+        )
+
+        self.assertEqual(first.estimated_payload_bpp,
+                         second.estimated_payload_bpp)
 
 
 if __name__ == '__main__':
