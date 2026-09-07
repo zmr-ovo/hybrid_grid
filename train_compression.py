@@ -18,6 +18,7 @@ from compression.model import CompressedHybridGridNet
 from compression.rate import (
     Fp32RateBreakdown,
     estimate_fp32_rate,
+    estimate_grid_metadata,
     parameter_storage,
 )
 from model import DynamicVideoDataset, HybridGridNet
@@ -93,7 +94,7 @@ def rate_distortion_loss(distortion, output, lambda_rate):
     return distortion + lambda_rate * rate, rate
 
 
-def _model_storage(model):
+def compression_model_storage(model):
     grid_parameter_ids = {
         id(level.grid)
         for level in model.reconstruction_model.grid_encoder.levels
@@ -111,19 +112,28 @@ def _model_storage(model):
     )
 
 
+def compression_grid_metadata(model):
+    grids = tuple(
+        level.grid for level in model.reconstruction_model.grid_encoder.levels
+    )
+    return estimate_grid_metadata(grids, model.quant_steps)
+
+
 def _averaged_rate_summary(grid_bits_sum, rate_sum, samples_seen,
                            total_video_pixels, non_grid_storage,
-                           entropy_model_storage):
+                           entropy_model_storage, quantization_metadata):
     if grid_bits_sum is None:
         return estimate_fp32_rate(
             total_video_pixels,
             non_grid_storage,
             entropy_model_storage,
+            quantization_metadata,
         )
     return estimate_fp32_rate(
         total_video_pixels,
         non_grid_storage,
         entropy_model_storage,
+        quantization_metadata,
         grid_bits=grid_bits_sum / samples_seen,
         legacy_rate_per_value=rate_sum / samples_seen,
     )
@@ -156,7 +166,7 @@ def _log_rate_summary(logger, prefix, summary, level_bits=()):
     if summary.estimated_grid_bits is None:
         logger.info(
             "%s BIT | Grid: N/A (quantization disabled) | estimated payload: "
-            "N/A | quantization/bitstream metadata: NOT INCLUDED",
+            "N/A | quantization metadata: NOT APPLICABLE",
             prefix,
         )
         return
@@ -164,7 +174,7 @@ def _log_rate_summary(logger, prefix, summary, level_bits=()):
     logger.info(
         "%s BIT | legacy rate/value: %.4f | Grid: %.0f bits "
         "(%.4f MiB, %.6f BPP) | estimated payload subtotal: %.0f bits "
-        "(%.4f MiB, %.6f BPP) | metadata: NOT INCLUDED",
+        "(%.4f MiB, %.6f BPP)",
         prefix,
         summary.legacy_rate_per_value,
         summary.estimated_grid_bits,
@@ -173,6 +183,26 @@ def _log_rate_summary(logger, prefix, summary, level_bits=()):
         summary.estimated_payload_bits,
         _mib(summary.estimated_payload_bits),
         summary.estimated_payload_bpp,
+    )
+    metadata = summary.quantization_metadata
+    logger.info(
+        "%s METADATA BIT | %d levels | header: %d bits | shapes: %d bits | "
+        "quant steps: %d bits | total: %d bits (%.6f BPP)",
+        prefix,
+        metadata.level_count,
+        metadata.header_bits,
+        metadata.shape_bits,
+        metadata.quant_step_bits,
+        metadata.total_bits,
+        summary.quantization_metadata_bpp,
+    )
+    logger.info(
+        "%s TOTAL BIT | estimated total: %.0f bits (%.4f MiB, %.6f BPP) | "
+        "actual bitstream: NOT AVAILABLE",
+        prefix,
+        summary.estimated_total_bits,
+        _mib(summary.estimated_total_bits),
+        summary.estimated_total_bpp,
     )
     if level_bits:
         logger.info(
@@ -199,6 +229,12 @@ def _write_rate_summary(writer, prefix, summary, level_bits, step):
             'estimated_grid_bpp': summary.estimated_grid_bpp,
             'estimated_payload_bits': summary.estimated_payload_bits,
             'estimated_payload_bpp': summary.estimated_payload_bpp,
+            'quantization_metadata_bits': (
+                summary.quantization_metadata.total_bits
+            ),
+            'quantization_metadata_bpp': summary.quantization_metadata_bpp,
+            'estimated_total_bits': summary.estimated_total_bits,
+            'estimated_total_bpp': summary.estimated_total_bpp,
         })
     for name, value in scalars.items():
         writer.add_scalar(prefix + '/' + name, value, step)
@@ -313,7 +349,8 @@ def load_compression_checkpoint(path, model, optimizer, device, config):
 
 @torch.no_grad()
 def evaluate_compression(model, loader, device, quant_mode, total_video_pixels,
-                         non_grid_storage, entropy_model_storage, save_dir=None,
+                         non_grid_storage, entropy_model_storage,
+                         quantization_metadata, save_dir=None,
                          dump_images=False, log_interval=50):
     was_training = model.training
     model.eval()
@@ -379,6 +416,7 @@ def evaluate_compression(model, loader, device, quant_mode, total_video_pixels,
         total_video_pixels,
         non_grid_storage,
         entropy_model_storage,
+        quantization_metadata,
     )
     level_bits = (
         () if level_bits_sum is None
@@ -452,7 +490,7 @@ def _make_loaders(args):
     return train_loader, val_loader, train_generator
 
 
-def _make_model(args, device):
+def build_compression_model(args, device):
     reconstruction_model = HybridGridNet(
         grid_levels=args.grid_levels,
         grid_feat_dim=args.grid_feat_dim,
@@ -482,11 +520,12 @@ def train_compression(args):
     logger.info("随机种子: %d", args.seed)
 
     train_loader, val_loader, train_generator = _make_loaders(args)
-    model = _make_model(args, device)
+    model = build_compression_model(args, device)
     total_video_pixels = (
         len(val_loader.dataset) * args.fixed_res[0] * args.fixed_res[1]
     )
-    non_grid_storage, entropy_model_storage = _model_storage(model)
+    non_grid_storage, entropy_model_storage = compression_model_storage(model)
+    quantization_metadata = compression_grid_metadata(model)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
@@ -505,6 +544,7 @@ def train_compression(args):
         total_video_pixels,
         non_grid_storage,
         entropy_model_storage,
+        quantization_metadata,
     )
     _log_rate_summary(logger, 'MODEL', initial_rate)
     for key, value in vars(args).items():
@@ -611,6 +651,7 @@ def train_compression(args):
             total_video_pixels,
             non_grid_storage,
             entropy_model_storage,
+            quantization_metadata,
         )
         level_bits = (
             () if level_bits_sum is None
@@ -664,6 +705,7 @@ def train_compression(args):
                 total_video_pixels,
                 non_grid_storage,
                 entropy_model_storage,
+                quantization_metadata,
                 save_dir=os.path.join(log_dir, 'visualize'),
                 dump_images=args.dump_images,
                 log_interval=args.log_interval,

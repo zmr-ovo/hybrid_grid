@@ -9,7 +9,8 @@ from compression.model import CompressedHybridGridNet
 from compression.rate import estimate_fp32_rate
 from model import HybridGridNet
 from train_compression import (
-    _model_storage,
+    compression_grid_metadata,
+    compression_model_storage,
     compression_stage,
     load_compression_checkpoint,
     rate_distortion_loss,
@@ -119,7 +120,7 @@ class RateDistortionLossTest(unittest.TestCase):
 
     def test_storage_rate_excludes_grid_from_fp32_network_bits(self):
         model = make_model()
-        non_grid, entropy = _model_storage(model)
+        non_grid, entropy = compression_model_storage(model)
         grid_parameters = sum(
             level.grid.numel()
             for level in model.reconstruction_model.grid_encoder.levels
@@ -139,10 +140,12 @@ class RateDistortionLossTest(unittest.TestCase):
         )
 
         output = model(torch.rand(1, 3, 2, 2), quant_mode='symbols')
+        metadata = compression_grid_metadata(model)
         summary = estimate_fp32_rate(
             1000,
             non_grid,
             entropy,
+            metadata,
             output.rate.total_bits.item(),
             output.rate.bits_per_value.item(),
         )
@@ -155,6 +158,10 @@ class RateDistortionLossTest(unittest.TestCase):
             summary.estimated_grid_bits
             + non_grid.total_bits
             + entropy.total_bits,
+        )
+        self.assertEqual(
+            summary.estimated_total_bits,
+            summary.estimated_payload_bits + metadata.total_bits,
         )
 
 

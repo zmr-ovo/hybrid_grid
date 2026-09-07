@@ -5,6 +5,7 @@ from torch import nn
 
 from compression.rate import (
     estimate_fp32_rate,
+    estimate_grid_metadata,
     estimate_grid_rate,
     parameter_storage,
 )
@@ -101,6 +102,29 @@ class ParameterStorageTest(unittest.TestCase):
             parameter_storage([parameter], required_dtype=torch.float32)
 
 
+class GridMetadataStorageTest(unittest.TestCase):
+    def test_counts_header_shapes_and_fp32_steps(self):
+        result = estimate_grid_metadata(
+            [torch.zeros(1, 2, 3), torch.zeros(4, 5)],
+            [1e-3, 2e-3],
+        )
+
+        self.assertEqual(result.level_count, 2)
+        self.assertEqual(result.shapes, ((1, 2, 3), (4, 5)))
+        self.assertEqual(result.header_bits, 32)
+        self.assertEqual(result.shape_bits, 176)
+        self.assertEqual(result.quant_step_bits, 64)
+        self.assertEqual(result.total_bits, 272)
+
+    def test_rejects_invalid_metadata_inputs(self):
+        with self.assertRaises(ValueError):
+            estimate_grid_metadata([], [])
+        with self.assertRaises(ValueError):
+            estimate_grid_metadata([torch.zeros(1)], [0.1, 0.2])
+        with self.assertRaises(ValueError):
+            estimate_grid_metadata([torch.zeros(1)], [0.0])
+
+
 class Fp32RateBreakdownTest(unittest.TestCase):
     def setUp(self):
         self.non_grid = parameter_storage([
@@ -109,12 +133,16 @@ class Fp32RateBreakdownTest(unittest.TestCase):
         self.entropy = parameter_storage([
             nn.Parameter(torch.zeros(2)),
         ], required_dtype=torch.float32)
+        self.metadata = estimate_grid_metadata(
+            [torch.zeros(1, 2, 3)], [1e-3],
+        )
 
     def test_reports_each_rate_component_and_payload_subtotal(self):
         result = estimate_fp32_rate(
             total_video_pixels=100,
             non_grid_storage=self.non_grid,
             entropy_model_storage=self.entropy,
+            quantization_metadata=self.metadata,
             grid_bits=400,
             legacy_rate_per_value=2.0,
         )
@@ -127,13 +155,18 @@ class Fp32RateBreakdownTest(unittest.TestCase):
         self.assertEqual(result.entropy_model_side_info_bpp, 0.64)
         self.assertEqual(result.estimated_payload_bits, 784)
         self.assertEqual(result.estimated_payload_bpp, 7.84)
-        self.assertFalse(result.metadata_included)
+        self.assertEqual(result.quantization_metadata.total_bits, 168)
+        self.assertEqual(result.quantization_metadata_bpp, 1.68)
+        self.assertEqual(result.estimated_total_bits, 952)
+        self.assertEqual(result.estimated_total_bpp, 9.52)
+        self.assertTrue(result.metadata_included)
 
     def test_disabled_grid_rate_is_not_reported_as_zero(self):
         result = estimate_fp32_rate(
             total_video_pixels=100,
             non_grid_storage=self.non_grid,
             entropy_model_storage=self.entropy,
+            quantization_metadata=self.metadata,
         )
 
         self.assertIsNone(result.legacy_rate_per_value)
@@ -141,18 +174,23 @@ class Fp32RateBreakdownTest(unittest.TestCase):
         self.assertIsNone(result.estimated_grid_bpp)
         self.assertIsNone(result.estimated_payload_bits)
         self.assertIsNone(result.estimated_payload_bpp)
+        self.assertIsNone(result.estimated_total_bits)
+        self.assertIsNone(result.estimated_total_bpp)
+        self.assertFalse(result.metadata_included)
         self.assertEqual(result.non_grid_bpp, 3.2)
 
     def test_bpp_depends_on_sequence_pixels_not_batch_size(self):
         first = estimate_fp32_rate(
-            100, self.non_grid, self.entropy, 400, 2.0,
+            100, self.non_grid, self.entropy, self.metadata, 400, 2.0,
         )
         second = estimate_fp32_rate(
-            100, self.non_grid, self.entropy, 400, 2.0,
+            100, self.non_grid, self.entropy, self.metadata, 400, 2.0,
         )
 
         self.assertEqual(first.estimated_payload_bpp,
                          second.estimated_payload_bpp)
+        self.assertEqual(first.estimated_total_bpp,
+                         second.estimated_total_bpp)
 
 
 if __name__ == '__main__':
