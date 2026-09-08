@@ -179,6 +179,21 @@ class Fp32RateBreakdownTest(unittest.TestCase):
         self.assertFalse(result.metadata_included)
         self.assertEqual(result.non_grid_bpp, 3.2)
 
+    def test_network_quantization_metadata_is_in_total_only(self):
+        result = estimate_fp32_rate(
+            total_video_pixels=100,
+            non_grid_storage=self.non_grid,
+            entropy_model_storage=self.entropy,
+            quantization_metadata=self.metadata,
+            grid_bits=400,
+            legacy_rate_per_value=2.0,
+            network_quantization_metadata_bits=80,
+        )
+
+        self.assertEqual(result.estimated_payload_bits, 784)
+        self.assertEqual(result.network_quantization_metadata_bpp, 0.8)
+        self.assertEqual(result.estimated_total_bits, 1032)
+
     def test_bpp_depends_on_sequence_pixels_not_batch_size(self):
         first = estimate_fp32_rate(
             100, self.non_grid, self.entropy, self.metadata, 400, 2.0,

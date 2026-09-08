@@ -9,6 +9,7 @@ from compression.model import CompressedHybridGridNet
 from compression.rate import estimate_fp32_rate
 from model import HybridGridNet
 from train_compression import (
+    build_compression_model,
     compression_grid_metadata,
     compression_model_storage,
     compression_stage,
@@ -48,6 +49,10 @@ def make_config(**overrides):
         'warmup_epochs': 30,
         'symbol_start_epoch': 270,
         'lambda_max': 5e-4,
+        'network_qat': False,
+        'network_quant_bits': 8,
+        'network_quant_start_epoch': 30,
+        'network_quant_freeze_epoch': 270,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -164,6 +169,15 @@ class RateDistortionLossTest(unittest.TestCase):
             summary.estimated_payload_bits + metadata.total_bits,
         )
 
+    def test_network_qat_storage_uses_eight_bits_and_excludes_grid(self):
+        config = make_config(network_qat=True)
+        model = build_compression_model(config, torch.device('cpu'))
+        non_grid, entropy = compression_model_storage(model)
+
+        self.assertEqual(non_grid.bits_by_dtype[0][0], 'uint8')
+        self.assertEqual(non_grid.total_bits, non_grid.parameter_count * 8)
+        self.assertEqual(entropy.total_bits, entropy.parameter_count * 8)
+
 
 class CompressionCheckpointTest(unittest.TestCase):
     def test_saves_and_restores_model_entropy_and_optimizer(self):
@@ -222,6 +236,28 @@ class CompressionCheckpointTest(unittest.TestCase):
                     torch.device('cpu'),
                     make_config(quant_step=0.2),
                 )
+
+    def test_saves_and_restores_network_qat_state(self):
+        config = make_config(network_qat=True)
+        model = build_compression_model(config, torch.device('cpu'))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'compression_qat.pth'
+            save_compression_checkpoint(
+                model, optimizer, 30, 0.0, 0.0, config, path,
+            )
+            restored = build_compression_model(config, torch.device('cpu'))
+            restored_optimizer = torch.optim.AdamW(
+                restored.parameters(), lr=5e-3,
+            )
+            load_compression_checkpoint(
+                path, restored, restored_optimizer, torch.device('cpu'), config,
+            )
+
+        self.assertEqual(model.architecture, restored.architecture)
+        for name, expected in model.state_dict().items():
+            self.assertTrue(torch.equal(expected, restored.state_dict()[name]))
 
 
 if __name__ == '__main__':

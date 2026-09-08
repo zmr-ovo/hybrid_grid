@@ -37,7 +37,7 @@ class GridMetadataStorage:
 
 @dataclass(frozen=True)
 class Fp32RateBreakdown:
-    """Estimated Grid and FP32 network rate before real entropy coding."""
+    """Estimated Grid and network rate before real entropy coding."""
 
     total_video_pixels: int
     legacy_rate_per_value: Optional[float]
@@ -49,6 +49,8 @@ class Fp32RateBreakdown:
     entropy_model_side_info_bpp: float
     quantization_metadata: GridMetadataStorage
     quantization_metadata_bpp: float
+    network_quantization_metadata_bits: int
+    network_quantization_metadata_bpp: float
     estimated_payload_bits: Optional[float]
     estimated_payload_bpp: Optional[float]
     estimated_total_bits: Optional[float]
@@ -146,8 +148,9 @@ def estimate_fp32_rate(
     quantization_metadata,
     grid_bits=None,
     legacy_rate_per_value=None,
+    network_quantization_metadata_bits=0,
 ):
-    """Combine Grid estimates with strict FP32 parameter storage costs."""
+    """Combine Grid estimates with network parameter storage costs."""
     if not isinstance(total_video_pixels, int) or isinstance(
         total_video_pixels, bool
     ) or total_video_pixels < 1:
@@ -158,6 +161,12 @@ def estimate_fp32_rate(
         raise TypeError("entropy_model_storage must be ParameterStorage")
     if not isinstance(quantization_metadata, GridMetadataStorage):
         raise TypeError("quantization_metadata must be GridMetadataStorage")
+    if (not isinstance(network_quantization_metadata_bits, int) or
+            isinstance(network_quantization_metadata_bits, bool) or
+            network_quantization_metadata_bits < 0):
+        raise ValueError(
+            "network_quantization_metadata_bits must be a non-negative integer"
+        )
 
     static_bits = (
         non_grid_storage.total_bits + entropy_model_storage.total_bits
@@ -165,6 +174,9 @@ def estimate_fp32_rate(
     non_grid_bpp = non_grid_storage.total_bits / total_video_pixels
     entropy_bpp = entropy_model_storage.total_bits / total_video_pixels
     metadata_bpp = quantization_metadata.total_bits / total_video_pixels
+    network_metadata_bpp = (
+        network_quantization_metadata_bits / total_video_pixels
+    )
 
     if grid_bits is None:
         if legacy_rate_per_value is not None:
@@ -196,6 +208,7 @@ def estimate_fp32_rate(
         estimated_payload_bpp = estimated_payload_bits / total_video_pixels
         estimated_total_bits = (
             estimated_payload_bits + quantization_metadata.total_bits
+            + network_quantization_metadata_bits
         )
         estimated_total_bpp = estimated_total_bits / total_video_pixels
         metadata_included = True
@@ -214,6 +227,8 @@ def estimate_fp32_rate(
         entropy_model_side_info_bpp=entropy_bpp,
         quantization_metadata=quantization_metadata,
         quantization_metadata_bpp=metadata_bpp,
+        network_quantization_metadata_bits=network_quantization_metadata_bits,
+        network_quantization_metadata_bpp=network_metadata_bpp,
         estimated_payload_bits=estimated_payload_bits,
         estimated_payload_bpp=estimated_payload_bpp,
         estimated_total_bits=estimated_total_bits,

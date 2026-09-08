@@ -15,6 +15,7 @@ from train_compression import (
     build_compression_model,
     compression_grid_metadata,
     compression_model_storage,
+    compression_network_metadata_bits,
     evaluate_compression,
 )
 
@@ -38,6 +39,14 @@ def load_compression_model(checkpoint_path, device):
         raise ValueError("压缩检查点缺少完整 config")
 
     config = Namespace(**saved_config)
+    for name, value in (
+        ('network_qat', False),
+        ('network_quant_bits', 8),
+        ('network_quant_start_epoch', 30),
+        ('network_quant_freeze_epoch', 270),
+    ):
+        if not hasattr(config, name):
+            setattr(config, name, value)
     try:
         model = build_compression_model(config, device)
     except AttributeError as error:
@@ -102,13 +111,35 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
         raise ValueError("Grid level bits do not sum to estimated_grid_bits")
 
     metadata = rate.quantization_metadata
+    qat_enabled = getattr(config, 'network_qat', False)
+    qat_bits = getattr(config, 'network_quant_bits', 8)
+    non_grid_key = (
+        'non_grid_uint{}'.format(qat_bits)
+        if qat_enabled else 'non_grid_fp32'
+    )
+    entropy_key = (
+        'entropy_model_uint{}'.format(qat_bits)
+        if qat_enabled else 'entropy_model_fp32'
+    )
 
-    return {
-        'schema_version': 2,
+    report = {
+        'schema_version': 3,
         'checkpoint': str(Path(checkpoint_path).resolve()),
         'checkpoint_epoch': checkpoint_epoch,
         'quant_mode': 'symbols',
         'quant_step': config.quant_step,
+        'network_qat': {
+            'enabled': qat_enabled,
+            'bits': qat_bits if qat_enabled else None,
+            'start_epoch': (
+                getattr(config, 'network_quant_start_epoch', 30)
+                if qat_enabled else None
+            ),
+            'freeze_epoch': (
+                getattr(config, 'network_quant_freeze_epoch', 270)
+                if qat_enabled else None
+            ),
+        },
         'model_config': {
             'grid_levels': config.grid_levels,
             'grid_feat_dim': config.grid_feat_dim,
@@ -138,13 +169,6 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
                 'mib': rate.estimated_grid_bits / 8 / 1024 ** 2,
                 'bpp': rate.estimated_grid_bpp,
             },
-            'non_grid_fp32': _storage_report(
-                rate.non_grid_storage, rate.non_grid_bpp,
-            ),
-            'entropy_model_fp32': _storage_report(
-                rate.entropy_model_storage,
-                rate.entropy_model_side_info_bpp,
-            ),
             'estimated_payload_subtotal': {
                 'bits': rate.estimated_payload_bits,
                 'mib': rate.estimated_payload_bits / 8 / 1024 ** 2,
@@ -161,6 +185,13 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
                 'mib': metadata.total_bits / 8 / 1024 ** 2,
                 'bpp': rate.quantization_metadata_bpp,
             },
+            'network_quantization_metadata': {
+                'bits': rate.network_quantization_metadata_bits,
+                'mib': (
+                    rate.network_quantization_metadata_bits / 8 / 1024 ** 2
+                ),
+                'bpp': rate.network_quantization_metadata_bpp,
+            },
             'estimated_total': {
                 'bits': rate.estimated_total_bits,
                 'mib': rate.estimated_total_bits / 8 / 1024 ** 2,
@@ -170,6 +201,13 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
             'actual_bitstream_available': False,
         },
     }
+    report['rate'][non_grid_key] = _storage_report(
+        rate.non_grid_storage, rate.non_grid_bpp,
+    )
+    report['rate'][entropy_key] = _storage_report(
+        rate.entropy_model_storage, rate.entropy_model_side_info_bpp,
+    )
+    return report
 
 
 def format_evaluation_report(report):
@@ -177,10 +215,15 @@ def format_evaluation_report(report):
     quality = report['quality']
     rate = report['rate']
     grid = rate['grid']
-    non_grid = rate['non_grid_fp32']
-    entropy = rate['entropy_model_fp32']
+    network_qat = report['network_qat']
+    storage_suffix = (
+        'uint{}'.format(network_qat['bits']) if network_qat['enabled'] else 'fp32'
+    )
+    non_grid = rate['non_grid_' + storage_suffix]
+    entropy = rate['entropy_model_' + storage_suffix]
     payload = rate['estimated_payload_subtotal']
     metadata = rate['quantization_metadata']
+    network_metadata = rate['network_quantization_metadata']
     estimated_total = rate['estimated_total']
     lines = [
         '========== Compression Evaluation ==========',
@@ -188,6 +231,10 @@ def format_evaluation_report(report):
         'Checkpoint epoch: {}'.format(report['checkpoint_epoch']),
         'Quant mode: symbols',
         'Quant step: {}'.format(report['quant_step']),
+        'Network QAT: {}'.format(
+            '{}-bit'.format(network_qat['bits'])
+            if network_qat['enabled'] else 'disabled'
+        ),
         'Model config: {}'.format(json.dumps(report['model_config'])),
         'Frames: {}'.format(sequence['frames']),
         'Resolution: {} x {}'.format(sequence['height'], sequence['width']),
@@ -209,14 +256,14 @@ def format_evaluation_report(report):
     )
     lines.extend([
         '',
-        'Non-Grid FP32 storage',
+        'Non-Grid {} storage'.format(storage_suffix.upper()),
         'Tensors: {}'.format(non_grid['tensor_count']),
         'Parameters: {}'.format(non_grid['parameter_count']),
         'Bits: {}'.format(non_grid['bits']),
         'Size: {:.6f} MiB'.format(non_grid['mib']),
         'BPP: {:.8f}'.format(non_grid['bpp']),
         '',
-        'Entropy model FP32 side information',
+        'Entropy model {} side information'.format(storage_suffix.upper()),
         'Tensors: {}'.format(entropy['tensor_count']),
         'Parameters: {}'.format(entropy['parameter_count']),
         'Bits: {}'.format(entropy['bits']),
@@ -236,6 +283,11 @@ def format_evaluation_report(report):
         'Bits: {}'.format(metadata['bits']),
         'Size: {:.6f} MiB'.format(metadata['mib']),
         'BPP: {:.8f}'.format(metadata['bpp']),
+        '',
+        'Network QAT metadata',
+        'Bits: {}'.format(network_metadata['bits']),
+        'Size: {:.6f} MiB'.format(network_metadata['mib']),
+        'BPP: {:.8f}'.format(network_metadata['bpp']),
         '',
         'Estimated total',
         'Bits: {:.0f}'.format(estimated_total['bits']),
@@ -275,6 +327,7 @@ def evaluate_checkpoint(args):
     total_video_pixels = len(loader.dataset) * height * width
     non_grid_storage, entropy_storage = compression_model_storage(model)
     quantization_metadata = compression_grid_metadata(model)
+    network_metadata_bits = compression_network_metadata_bits(model)
 
     output_dir = args.output_dir or str(
         Path(args.checkpoint).resolve().parent / 'evaluation'
@@ -305,6 +358,7 @@ def evaluate_checkpoint(args):
         non_grid_storage,
         entropy_storage,
         quantization_metadata,
+        network_metadata_bits,
         save_dir=str(Path(output_dir) / 'reconstructions'),
         dump_images=args.dump_images,
         log_interval=args.log_interval,

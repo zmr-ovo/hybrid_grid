@@ -15,8 +15,15 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
 from compression.model import CompressedHybridGridNet
+from compression.network_quantization import (
+    configure_network_qat,
+    network_qat_state,
+    network_qat_storage,
+    prepare_network_qat,
+)
 from compression.rate import (
     Fp32RateBreakdown,
+    ParameterStorage,
     estimate_fp32_rate,
     estimate_grid_metadata,
     parameter_storage,
@@ -30,6 +37,8 @@ CHECKPOINT_CONFIG_KEYS = (
     'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
     'aspect_ratio', 'time_scale', 'pe_freq', 'hidden_dim', 'quant_step',
     'epochs', 'warmup_epochs', 'symbol_start_epoch', 'lambda_max',
+    'network_qat', 'network_quant_bits', 'network_quant_start_epoch',
+    'network_quant_freeze_epoch',
 )
 
 
@@ -95,6 +104,27 @@ def rate_distortion_loss(distortion, output, lambda_rate):
 
 
 def compression_model_storage(model):
+    qat_storage = network_qat_storage(model)
+    if qat_storage:
+        non_grid = qat_storage['non_grid']
+        entropy = qat_storage['entropy']
+        return (
+            ParameterStorage(
+                non_grid.tensor_count,
+                non_grid.parameter_count,
+                non_grid.payload_bits,
+                (('uint{}'.format(model.network_quant_bits),
+                  non_grid.payload_bits),),
+            ),
+            ParameterStorage(
+                entropy.tensor_count,
+                entropy.parameter_count,
+                entropy.payload_bits,
+                (('uint{}'.format(model.network_quant_bits),
+                  entropy.payload_bits),),
+            ),
+        )
+
     grid_parameter_ids = {
         id(level.grid)
         for level in model.reconstruction_model.grid_encoder.levels
@@ -112,6 +142,13 @@ def compression_model_storage(model):
     )
 
 
+def compression_network_metadata_bits(model):
+    return sum(
+        storage.metadata_bits
+        for storage in network_qat_storage(model).values()
+    )
+
+
 def compression_grid_metadata(model):
     grids = tuple(
         level.grid for level in model.reconstruction_model.grid_encoder.levels
@@ -121,13 +158,15 @@ def compression_grid_metadata(model):
 
 def _averaged_rate_summary(grid_bits_sum, rate_sum, samples_seen,
                            total_video_pixels, non_grid_storage,
-                           entropy_model_storage, quantization_metadata):
+                           entropy_model_storage, quantization_metadata,
+                           network_metadata_bits=0):
     if grid_bits_sum is None:
         return estimate_fp32_rate(
             total_video_pixels,
             non_grid_storage,
             entropy_model_storage,
             quantization_metadata,
+            network_quantization_metadata_bits=network_metadata_bits,
         )
     return estimate_fp32_rate(
         total_video_pixels,
@@ -136,6 +175,7 @@ def _averaged_rate_summary(grid_bits_sum, rate_sum, samples_seen,
         quantization_metadata,
         grid_bits=grid_bits_sum / samples_seen,
         legacy_rate_per_value=rate_sum / samples_seen,
+        network_quantization_metadata_bits=network_metadata_bits,
     )
 
 
@@ -143,26 +183,42 @@ def _mib(bits):
     return bits / 8 / 1024 ** 2
 
 
+def _storage_label(storage):
+    if len(storage.bits_by_dtype) == 1:
+        return storage.bits_by_dtype[0][0].upper()
+    return 'MIXED'
+
+
 def _log_rate_summary(logger, prefix, summary, level_bits=()):
     non_grid = summary.non_grid_storage
     entropy = summary.entropy_model_storage
     logger.info(
-        "%s BIT | video pixels: %d | non-Grid FP32: %d tensors, %d params, "
-        "%d bits (%.4f MiB, %.6f BPP) | entropy side FP32: %d tensors, "
+        "%s BIT | video pixels: %d | non-Grid %s: %d tensors, %d params, "
+        "%d bits (%.4f MiB, %.6f BPP) | entropy side %s: %d tensors, "
         "%d params, %d bits (%.4f MiB, %.6f BPP)",
         prefix,
         summary.total_video_pixels,
+        _storage_label(non_grid),
         non_grid.tensor_count,
         non_grid.parameter_count,
         non_grid.total_bits,
         _mib(non_grid.total_bits),
         summary.non_grid_bpp,
+        _storage_label(entropy),
         entropy.tensor_count,
         entropy.parameter_count,
         entropy.total_bits,
         _mib(entropy.total_bits),
         summary.entropy_model_side_info_bpp,
     )
+    if summary.network_quantization_metadata_bits:
+        logger.info(
+            "%s NETWORK QAT METADATA BIT | scales, zero-points and shapes: "
+            "%d bits (%.6f BPP)",
+            prefix,
+            summary.network_quantization_metadata_bits,
+            summary.network_quantization_metadata_bpp,
+        )
     if summary.estimated_grid_bits is None:
         logger.info(
             "%s BIT | Grid: N/A (quantization disabled) | estimated payload: "
@@ -217,10 +273,16 @@ def _log_rate_summary(logger, prefix, summary, level_bits=()):
 
 def _write_rate_summary(writer, prefix, summary, level_bits, step):
     scalars = {
-        'non_grid_fp32_bits': summary.non_grid_storage.total_bits,
-        'non_grid_fp32_bpp': summary.non_grid_bpp,
-        'entropy_model_fp32_bits': summary.entropy_model_storage.total_bits,
-        'entropy_model_fp32_bpp': summary.entropy_model_side_info_bpp,
+        'non_grid_parameter_bits': summary.non_grid_storage.total_bits,
+        'non_grid_parameter_bpp': summary.non_grid_bpp,
+        'entropy_model_parameter_bits': summary.entropy_model_storage.total_bits,
+        'entropy_model_parameter_bpp': summary.entropy_model_side_info_bpp,
+        'network_quantization_metadata_bits': (
+            summary.network_quantization_metadata_bits
+        ),
+        'network_quantization_metadata_bpp': (
+            summary.network_quantization_metadata_bpp
+        ),
     }
     if summary.estimated_grid_bits is not None:
         scalars.update({
@@ -350,7 +412,8 @@ def load_compression_checkpoint(path, model, optimizer, device, config):
 @torch.no_grad()
 def evaluate_compression(model, loader, device, quant_mode, total_video_pixels,
                          non_grid_storage, entropy_model_storage,
-                         quantization_metadata, save_dir=None,
+                         quantization_metadata, network_metadata_bits=0,
+                         save_dir=None,
                          dump_images=False, log_interval=50):
     was_training = model.training
     model.eval()
@@ -417,6 +480,7 @@ def evaluate_compression(model, loader, device, quant_mode, total_video_pixels,
         non_grid_storage,
         entropy_model_storage,
         quantization_metadata,
+        network_metadata_bits,
     )
     level_bits = (
         () if level_bits_sum is None
@@ -448,6 +512,14 @@ def _validate_args(args):
         args.save_interval, args.log_interval, args.eval_freq,
     )):
         raise ValueError("save, log and evaluation intervals must be positive")
+    if args.network_qat:
+        if not 2 <= args.network_quant_bits <= 16:
+            raise ValueError("network_quant_bits must be between 2 and 16")
+        if not (0 <= args.network_quant_start_epoch <=
+                args.network_quant_freeze_epoch < args.epochs):
+            raise ValueError(
+                "expected 0 <= network quant start <= freeze < epochs"
+            )
 
 
 def _make_loaders(args):
@@ -501,10 +573,19 @@ def build_compression_model(args, device):
         pe_freq=args.pe_freq,
         hidden_dim=args.hidden_dim,
     )
-    return CompressedHybridGridNet(
+    model = CompressedHybridGridNet(
         reconstruction_model,
         quant_steps=args.quant_step,
-    ).to(device)
+    )
+    if getattr(args, 'network_qat', False):
+        grid_parameters = tuple(
+            level.grid for level in reconstruction_model.grid_encoder.levels
+        )
+        bits = args.network_quant_bits
+        prepare_network_qat(model, bits, excluded_parameters=grid_parameters)
+        model.network_quant_bits = bits
+        model.architecture = 'hybrid_grid_compressed_network_qat_v1'
+    return model.to(device)
 
 
 def train_compression(args):
@@ -526,6 +607,7 @@ def train_compression(args):
     )
     non_grid_storage, entropy_model_storage = compression_model_storage(model)
     quantization_metadata = compression_grid_metadata(model)
+    network_metadata_bits = compression_network_metadata_bits(model)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
@@ -545,8 +627,10 @@ def train_compression(args):
         non_grid_storage,
         entropy_model_storage,
         quantization_metadata,
+        network_quantization_metadata_bits=network_metadata_bits,
     )
     _log_rate_summary(logger, 'MODEL', initial_rate)
+    logger.info("非 Grid 网络 QAT 状态: %s", network_qat_state(model))
     for key, value in vars(args).items():
         logger.info("%s: %s", key, value)
 
@@ -564,6 +648,10 @@ def train_compression(args):
     training_start = time.time()
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        if args.network_qat:
+            qat_enabled = epoch >= args.network_quant_start_epoch
+            qat_frozen = epoch >= args.network_quant_freeze_epoch
+            configure_network_qat(model, qat_enabled, qat_frozen)
         train_generator.manual_seed(args.seed + epoch)
         stage = compression_stage(
             epoch,
@@ -624,6 +712,7 @@ def train_compression(args):
                     batch_index == len(train_loader) - 1):
                 logger.info(
                     "epoch [%d/%d] batch [%d/%d] | mode: %s | "
+                    "network QAT: %s | "
                     "lambda: %.3e | distortion: %.6f | rate/value: %.4f | "
                     "total: %.6f | PSNR: %.2f dB | lr: %.3e",
                     epoch + 1,
@@ -631,6 +720,7 @@ def train_compression(args):
                     batch_index + 1,
                     len(train_loader),
                     stage.quant_mode,
+                    network_qat_state(model),
                     stage.lambda_rate,
                     distortion.item(),
                     rate.item(),
@@ -652,6 +742,7 @@ def train_compression(args):
             non_grid_storage,
             entropy_model_storage,
             quantization_metadata,
+            network_metadata_bits,
         )
         level_bits = (
             () if level_bits_sum is None
@@ -674,14 +765,23 @@ def train_compression(args):
             {'disabled': 0, 'noise': 1, 'symbols': 2}[stage.quant_mode],
             epoch + 1,
         )
+        writer.add_scalar(
+            'train/network_qat_state',
+            {'not prepared': 0, 'disabled': 0, 'calibrating': 1, 'frozen': 2}[
+                network_qat_state(model)
+            ],
+            epoch + 1,
+        )
         writer.add_scalar('time/epoch_sec', epoch_seconds, epoch + 1)
         _write_rate_summary(writer, 'train_rate', epoch_rate, level_bits, epoch + 1)
         logger.info(
-            "Epoch %d | mode: %s | lambda: %.3e | distortion: %.6f | "
+            "Epoch %d | mode: %s | network QAT: %s | lambda: %.3e | "
+            "distortion: %.6f | "
             "rate/value: %.4f | total: %.6f | PSNR: %.2f dB | "
             "BEST TRAIN: %.2f dB | MS-SSIM: %.4f | time: %.2fs",
             epoch + 1,
             stage.quant_mode,
+            network_qat_state(model),
             stage.lambda_rate,
             avg_distortion,
             avg_rate,
@@ -706,6 +806,7 @@ def train_compression(args):
                 non_grid_storage,
                 entropy_model_storage,
                 quantization_metadata,
+                network_metadata_bits,
                 save_dir=os.path.join(log_dir, 'visualize'),
                 dump_images=args.dump_images,
                 log_interval=args.log_interval,
@@ -773,6 +874,13 @@ def build_parser():
     parser.add_argument('--symbol_start_epoch', type=int, default=270)
     parser.add_argument('--lambda_max', type=float, default=5e-4)
     parser.add_argument('--quant_step', type=float, default=1e-3)
+    parser.add_argument(
+        '--network_qat', action='store_true',
+        help='对非 Grid 参数启用训练中模拟量化',
+    )
+    parser.add_argument('--network_quant_bits', type=int, default=8)
+    parser.add_argument('--network_quant_start_epoch', type=int, default=30)
+    parser.add_argument('--network_quant_freeze_epoch', type=int, default=270)
 
     parser.add_argument('--grid_levels', type=int, default=10)
     parser.add_argument('--grid_feat_dim', type=int, default=6)
