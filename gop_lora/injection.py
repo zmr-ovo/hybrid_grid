@@ -7,7 +7,7 @@ from .linear import GOPLoRALinear
 
 
 class GOPLoRADecoder(nn.Module):
-    """Preserve the paper Decoder while routing its LoRA update by GOP."""
+    """Use the anchor Decoder for GOP 0 and route later-GOP adapters."""
 
     def __init__(self, shared_decoder, num_gops, rank, alpha):
         super().__init__()
@@ -41,7 +41,7 @@ class GOPLoRADecoder(nn.Module):
 
 
 def inject_gop_lora(model, num_gops, rank, alpha=1.0, target='decoder'):
-    """Inject GOP LoRA into the five paper Decoder linear layers."""
+    """Add one independent adapter per later GOP to each Decoder layer."""
     if not isinstance(model, HybridGridNet):
         raise TypeError("model must be HybridGridNet")
     if target != 'decoder':

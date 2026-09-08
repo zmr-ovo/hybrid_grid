@@ -13,7 +13,7 @@ def _positive_integer(name, value):
 
 
 class GOPLoRALinear(nn.Module):
-    """Apply one shared linear layer with a GOP-specific low-rank update."""
+    """Use the anchor for GOP 0 and one independent adapter per later GOP."""
 
     def __init__(self, shared_linear, num_gops, rank, alpha=1.0):
         super().__init__()
@@ -34,7 +34,7 @@ class GOPLoRALinear(nn.Module):
         self.scaling = self.alpha / self.rank
         self.lora_a = nn.ParameterList()
         self.lora_b = nn.ParameterList()
-        for _ in range(self.num_gops):
+        for _ in range(self.num_gops - 1):
             matrix_a = nn.Parameter(shared_linear.weight.new_empty(
                 self.rank, shared_linear.in_features,
             ))
@@ -61,8 +61,12 @@ class GOPLoRALinear(nn.Module):
         gop_index = self._normalize_gop_index(gop_index)
 
         base = self.shared(inputs)
-        low_rank = F.linear(F.linear(inputs, self.lora_a[gop_index]),
-                            self.lora_b[gop_index])
+        if gop_index == 0:
+            return base
+
+        adapter_index = gop_index - 1
+        low_rank = F.linear(F.linear(inputs, self.lora_a[adapter_index]),
+                            self.lora_b[adapter_index])
         return base + low_rank * self.scaling
 
     def shared_parameters(self):
@@ -76,7 +80,10 @@ class GOPLoRALinear(nn.Module):
 
     def gop_parameters(self, gop_index):
         gop_index = self._normalize_gop_index(gop_index)
-        return self.lora_a[gop_index], self.lora_b[gop_index]
+        if gop_index == 0:
+            return ()
+        adapter_index = gop_index - 1
+        return self.lora_a[adapter_index], self.lora_b[adapter_index]
 
     def _normalize_gop_index(self, gop_index):
         if torch.is_tensor(gop_index):
@@ -99,11 +106,13 @@ class GOPLoRALinear(nn.Module):
 
     def extra_repr(self):
         return (
-            'in_features={}, out_features={}, num_gops={}, rank={}, alpha={}'
+            'in_features={}, out_features={}, num_gops={}, adapters={}, '
+            'rank={}, alpha={}'
         ).format(
             self.in_features,
             self.out_features,
             self.num_gops,
+            self.num_gops - 1,
             self.rank,
             self.alpha,
         )

@@ -50,6 +50,7 @@ class GOPLoRAInjectionTest(unittest.TestCase):
         self.assertEqual(len(layers), 5)
         for layer, weight in zip(layers, original_weights):
             self.assertIs(layer.shared.weight, weight)
+            self.assertEqual(len(layer.lora_a), 2)
 
     def test_does_not_inject_grid_gate_or_temporal_modulation(self):
         model = make_model()
@@ -78,24 +79,25 @@ class GOPLoRAInjectionTest(unittest.TestCase):
         self.assertTrue(all(
             not parameter.requires_grad for parameter in shared_parameters(model)
         ))
-        self.assertEqual(len(gop_parameters(model, 0)), 10)
+        self.assertEqual(gop_parameters(model, 0), ())
+        self.assertEqual(len(gop_parameters(model, 1)), 10)
 
     def test_backward_only_reaches_the_selected_gop(self):
         model = make_model()
-        inject_gop_lora(model, num_gops=2, rank=1)
+        inject_gop_lora(model, num_gops=3, rank=1)
         freeze_shared_parameters(model)
         for layer in gop_lora_layers(model):
             with torch.no_grad():
                 layer.lora_a[0].fill_(1.0)
                 layer.lora_b[0].fill_(1.0)
 
-        model.decoder(torch.randn(4, model.decoder.input_dim), 0).sum().backward()
+        model.decoder(torch.randn(4, model.decoder.input_dim), 1).sum().backward()
 
         self.assertTrue(all(
-            parameter.grad is not None for parameter in gop_parameters(model, 0)
+            parameter.grad is not None for parameter in gop_parameters(model, 1)
         ))
         self.assertTrue(all(
-            parameter.grad is None for parameter in gop_parameters(model, 1)
+            parameter.grad is None for parameter in gop_parameters(model, 2)
         ))
         self.assertTrue(all(
             parameter.grad is None for parameter in shared_parameters(model)

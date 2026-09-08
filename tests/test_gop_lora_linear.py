@@ -29,16 +29,16 @@ class GOPLoRALinearTest(unittest.TestCase):
         gop_zero = layer(inputs, 0)
         gop_one = layer(inputs, 1)
 
-        self.assertFalse(torch.equal(gop_zero, base))
-        self.assertTrue(torch.equal(gop_one, base))
+        self.assertTrue(torch.equal(gop_zero, base))
+        self.assertFalse(torch.equal(gop_one, base))
 
     def test_backward_only_reaches_selected_gop(self):
-        layer = GOPLoRALinear(nn.Linear(3, 2), num_gops=2, rank=1)
+        layer = GOPLoRALinear(nn.Linear(3, 2), num_gops=3, rank=1)
         with torch.no_grad():
             layer.lora_a[0].fill_(1.0)
             layer.lora_b[0].fill_(1.0)
 
-        layer(torch.ones(1, 3), 0).sum().backward()
+        layer(torch.ones(1, 3), 1).sum().backward()
 
         self.assertTrue(torch.any(layer.lora_a[0].grad != 0))
         self.assertTrue(torch.any(layer.lora_b[0].grad != 0))
@@ -66,14 +66,15 @@ class GOPLoRALinearTest(unittest.TestCase):
         self.assertIs(layer.shared, shared)
         self.assertIs(layer.shared.weight, shared.weight)
         self.assertEqual(layer.shared_parameters(), (shared.weight, shared.bias))
-        self.assertEqual(len(layer.lora_parameters()), 4)
-        self.assertIs(layer.gop_parameters(1)[0], layer.lora_a[1])
+        self.assertEqual(len(layer.lora_parameters()), 2)
+        self.assertEqual(layer.gop_parameters(0), ())
+        self.assertIs(layer.gop_parameters(1)[0], layer.lora_a[0])
 
     def test_state_dict_restores_identical_output(self):
         layer = GOPLoRALinear(nn.Linear(3, 2), num_gops=2, rank=1)
         with torch.no_grad():
-            layer.lora_a[1].fill_(0.25)
-            layer.lora_b[1].fill_(0.5)
+            layer.lora_a[0].fill_(0.25)
+            layer.lora_b[0].fill_(0.5)
         inputs = torch.randn(2, 3)
         expected = layer(inputs, 1)
 
