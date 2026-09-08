@@ -17,17 +17,30 @@ class GOPLoRADecoder(nn.Module):
         self.input_dim = shared_decoder.input_dim
         self.hidden_dim = shared_decoder.hidden_dim
         self.skip_layer = shared_decoder.skip_layer
+        self.rank = rank
+        self.alpha = float(alpha)
         self.linear = nn.ModuleList([
             GOPLoRALinear(layer, num_gops, rank, alpha)
             for layer in shared_decoder.linear
         ])
+        output_linear = shared_decoder.output_layer[0]
+        output_rank = min(
+            rank, output_linear.in_features, output_linear.out_features,
+        )
+        output_alpha = self.alpha * output_rank / rank
         self.output_layer = nn.ModuleList([
             GOPLoRALinear(
-                shared_decoder.output_layer[0], num_gops, rank, alpha,
+                output_linear, num_gops, output_rank, output_alpha,
             ),
             shared_decoder.output_layer[1],
         ])
         self.act = shared_decoder.act
+
+    @property
+    def effective_ranks(self):
+        return tuple(
+            layer.rank for layer in tuple(self.linear) + (self.output_layer[0],)
+        )
 
     def forward(self, inputs, gop_index):
         hidden = inputs

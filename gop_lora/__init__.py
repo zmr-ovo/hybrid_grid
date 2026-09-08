@@ -9,7 +9,7 @@ from .injection import (
     lora_parameters,
     shared_parameters,
 )
-from .model import GOPLoRAHybridGridNet
+from .model import GOPLoRAHybridGridNet, gop_local_coordinates
 from .video_dataset import GOPVideoDataset
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     'GOPLoRALinear',
     'GOPLoRADecoder',
     'GOPLoRAHybridGridNet',
+    'gop_local_coordinates',
     'GOPVideoDataset',
     'freeze_shared_parameters',
     'gop_lora_layers',

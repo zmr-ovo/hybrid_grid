@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from gop_lora.injection import gop_lora_layers
-from gop_lora.model import GOPLoRAHybridGridNet
+from gop_lora.model import GOPLoRAHybridGridNet, gop_local_coordinates
 from model import HybridGridNet
 
 
@@ -28,6 +28,16 @@ def with_local_time(coords, local_time):
 
 
 class GOPLoRAModelTest(unittest.TestCase):
+    def test_local_coordinates_do_not_modify_dataset_coordinates(self):
+        coords = torch.rand(2, 3, 3, 4)
+        original = coords.clone()
+
+        local = gop_local_coordinates(coords, torch.tensor([0.0, 1.0]))
+
+        self.assertTrue(torch.equal(coords, original))
+        self.assertTrue(torch.equal(local[:, :2], original[:, :2]))
+        self.assertTrue(torch.equal(local[:, 2, 0, 0], torch.tensor([0.0, 1.0])))
+
     def test_zero_initialization_matches_the_paper_model(self):
         baseline = make_model()
         shared = copy.deepcopy(baseline)

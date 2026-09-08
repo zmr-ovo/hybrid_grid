@@ -66,6 +66,17 @@ class GOPLoRAInjectionTest(unittest.TestCase):
         self.assertFalse(any('gate_' in name for name in lora_names))
         self.assertFalse(any('time_mod' in name for name in lora_names))
 
+    def test_caps_only_the_rgb_output_rank_and_preserves_scaling(self):
+        model = make_model()
+
+        inject_gop_lora(model, num_gops=2, rank=8, alpha=8)
+
+        layers = gop_lora_layers(model)
+        self.assertEqual(model.decoder.effective_ranks, (8, 8, 8, 8, 3))
+        self.assertEqual(tuple(layer.rank for layer in layers), (8, 8, 8, 8, 3))
+        self.assertTrue(all(layer.scaling == 1.0 for layer in layers))
+        self.assertEqual(layers[-1].alpha, 3.0)
+
     def test_freezes_everything_except_all_lora_parameters(self):
         model = make_model()
         inject_gop_lora(model, num_gops=2, rank=1)
