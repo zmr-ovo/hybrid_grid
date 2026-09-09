@@ -119,25 +119,30 @@ class FakeQuantizedParameter(nn.Module):
 
 
 def prepare_network_qat(model, bits=8, excluded_parameters=()):
-    """Attach fake quantizers to every non-Grid trainable parameter."""
+    """Attach per-output-channel fake quantizers to Linear weights only."""
     excluded_ids = {id(parameter) for parameter in excluded_parameters}
     entropy_ids = {
         id(parameter) for parameter in model.entropy_models.parameters()
     }
     targets = []
     for _, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
         for name, parameter in module.named_parameters(recurse=False):
-            if id(parameter) in excluded_ids:
+            if (name != 'weight' or parameter.ndim != 2 or
+                    not parameter.requires_grad or
+                    id(parameter) in excluded_ids or
+                    id(parameter) in entropy_ids):
                 continue
-            group = 'entropy' if id(parameter) in entropy_ids else 'non_grid'
-            axis = 0 if parameter.ndim >= 2 else None
-            targets.append((module, name, parameter, axis, group))
+            targets.append((module, name, parameter))
 
-    for module, name, parameter, axis, group in targets:
+    for module, name, parameter in targets:
         parametrize.register_parametrization(
             module,
             name,
-            FakeQuantizedParameter(parameter, bits, axis, group),
+            FakeQuantizedParameter(
+                parameter, bits=bits, axis=0, group='non_grid',
+            ),
         )
     return len(targets)
 
@@ -146,6 +151,19 @@ def iter_network_quantizers(model):
     for module in model.modules():
         if isinstance(module, FakeQuantizedParameter):
             yield module
+
+
+def iter_quantized_network_parameters(model):
+    """Yield the original parameters represented by network quantizers."""
+    for module in model.modules():
+        parametrizations = getattr(module, 'parametrizations', {})
+        for name in parametrizations:
+            parametrization = parametrizations[name]
+            if any(
+                isinstance(item, FakeQuantizedParameter)
+                for item in parametrization
+            ):
+                yield parametrization.original
 
 
 def configure_network_qat(model, enabled, freeze=False):

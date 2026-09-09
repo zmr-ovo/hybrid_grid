@@ -62,27 +62,39 @@ class FakeQuantizedParameterTest(unittest.TestCase):
 
 
 class NetworkQatModelTest(unittest.TestCase):
-    def test_prepares_every_parameter_except_grid(self):
+    def test_prepares_only_linear_weights(self):
         model = make_model()
         grids = tuple(
             level.grid for level in model.reconstruction_model.grid_encoder.levels
         )
-        grid_ids = {id(grid) for grid in grids}
-        expected_tensors = sum(
-            id(parameter) not in grid_ids for parameter in model.parameters()
+        linear_layers = tuple(
+            module for module in model.reconstruction_model.modules()
+            if isinstance(module, torch.nn.Linear)
         )
 
         count = prepare_network_qat(model, 8, excluded_parameters=grids)
 
-        self.assertEqual(count, expected_tensors)
+        self.assertEqual(count, len(linear_layers))
+        for layer in linear_layers:
+            self.assertTrue(parametrize.is_parametrized(layer, 'weight'))
+            self.assertFalse(parametrize.is_parametrized(layer, 'bias'))
         for level in model.reconstruction_model.grid_encoder.levels:
             self.assertFalse(parametrize.is_parametrized(level, 'grid'))
+        self.assertFalse(
+            parametrize.is_parametrized(
+                model.reconstruction_model.pe_encoder, 'freqs',
+            )
+        )
+        for entropy_model in model.entropy_models:
+            for module in entropy_model.modules():
+                for name, _ in module.named_parameters(recurse=False):
+                    self.assertFalse(parametrize.is_parametrized(module, name))
+
         storage = network_qat_storage(model)
-        self.assertEqual(set(storage), {'non_grid', 'entropy'})
+        self.assertEqual(set(storage), {'non_grid'})
         self.assertEqual(
             storage['non_grid'].parameter_count,
-            sum(parameter.numel() for parameter in model.reconstruction_model.parameters())
-            - sum(grid.numel() for grid in grids),
+            sum(layer.weight.numel() for layer in linear_layers),
         )
 
     def test_qat_state_is_explicit(self):

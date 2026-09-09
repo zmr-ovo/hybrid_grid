@@ -169,14 +169,27 @@ class RateDistortionLossTest(unittest.TestCase):
             summary.estimated_payload_bits + metadata.total_bits,
         )
 
-    def test_network_qat_storage_uses_eight_bits_and_excludes_grid(self):
+    def test_network_qat_storage_uses_mixed_precision_and_excludes_grid(self):
         config = make_config(network_qat=True)
         model = build_compression_model(config, torch.device('cpu'))
         non_grid, entropy = compression_model_storage(model)
 
-        self.assertEqual(non_grid.bits_by_dtype[0][0], 'uint8')
-        self.assertEqual(non_grid.total_bits, non_grid.parameter_count * 8)
-        self.assertEqual(entropy.total_bits, entropy.parameter_count * 8)
+        linear_weights = sum(
+            module.weight.numel()
+            for module in model.reconstruction_model.modules()
+            if isinstance(module, torch.nn.Linear)
+        )
+        fp32_parameters = non_grid.parameter_count - linear_weights
+        self.assertEqual(
+            dict(non_grid.bits_by_dtype),
+            {'float32': fp32_parameters * 32, 'uint8': linear_weights * 8},
+        )
+        self.assertEqual(
+            non_grid.total_bits,
+            fp32_parameters * 32 + linear_weights * 8,
+        )
+        self.assertEqual(entropy.bits_by_dtype[0][0], 'float32')
+        self.assertEqual(entropy.total_bits, entropy.parameter_count * 32)
 
 
 class CompressionCheckpointTest(unittest.TestCase):

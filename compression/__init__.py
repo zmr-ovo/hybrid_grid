@@ -3,6 +3,7 @@ from .model import CompressedHybridGridNet, CompressedModelOutput
 from .network_quantization import (
     FakeQuantizedParameter,
     configure_network_qat,
+    iter_quantized_network_parameters,
     network_qat_state,
     network_qat_storage,
     prepare_network_qat,
@@ -31,6 +32,7 @@ __all__ = [
     'parameter_storage',
     'prepare_network_qat',
     'configure_network_qat',
+    'iter_quantized_network_parameters',
     'network_qat_state',
     'network_qat_storage',
     'quantize_grid',

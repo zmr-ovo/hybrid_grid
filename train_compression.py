@@ -17,6 +17,7 @@ from torchvision.utils import save_image
 from compression.model import CompressedHybridGridNet
 from compression.network_quantization import (
     configure_network_qat,
+    iter_quantized_network_parameters,
     network_qat_state,
     network_qat_storage,
     prepare_network_qat,
@@ -106,22 +107,38 @@ def rate_distortion_loss(distortion, output, lambda_rate):
 def compression_model_storage(model):
     qat_storage = network_qat_storage(model)
     if qat_storage:
-        non_grid = qat_storage['non_grid']
-        entropy = qat_storage['entropy']
+        quantized = qat_storage['non_grid']
+        quantized_ids = {
+            id(parameter)
+            for parameter in iter_quantized_network_parameters(model)
+        }
+        grid_ids = {
+            id(level.grid)
+            for level in model.reconstruction_model.grid_encoder.levels
+        }
+        fp32 = parameter_storage(
+            parameter
+            for parameter in model.reconstruction_model.parameters()
+            if id(parameter) not in grid_ids
+            and id(parameter) not in quantized_ids
+        )
+        bits_by_dtype = tuple(
+            item for item in (
+                ('float32', fp32.total_bits),
+                ('uint{}'.format(model.network_quant_bits),
+                 quantized.payload_bits),
+            ) if item[1]
+        )
         return (
             ParameterStorage(
-                non_grid.tensor_count,
-                non_grid.parameter_count,
-                non_grid.payload_bits,
-                (('uint{}'.format(model.network_quant_bits),
-                  non_grid.payload_bits),),
+                fp32.tensor_count + quantized.tensor_count,
+                fp32.parameter_count + quantized.parameter_count,
+                fp32.total_bits + quantized.payload_bits,
+                bits_by_dtype,
             ),
-            ParameterStorage(
-                entropy.tensor_count,
-                entropy.parameter_count,
-                entropy.payload_bits,
-                (('uint{}'.format(model.network_quant_bits),
-                  entropy.payload_bits),),
+            parameter_storage(
+                model.entropy_models.parameters(),
+                required_dtype=torch.float32,
             ),
         )
 
@@ -211,6 +228,20 @@ def _log_rate_summary(logger, prefix, summary, level_bits=()):
         _mib(entropy.total_bits),
         summary.entropy_model_side_info_bpp,
     )
+    if len(non_grid.bits_by_dtype) > 1:
+        logger.info(
+            "%s NON-GRID PRECISION BIT | %s",
+            prefix,
+            " | ".join(
+                "{}: {} bits ({:.4f} MiB, {:.6f} BPP)".format(
+                    dtype.upper(),
+                    bits,
+                    _mib(bits),
+                    bits / summary.total_video_pixels,
+                )
+                for dtype, bits in non_grid.bits_by_dtype
+            ),
+        )
     if summary.network_quantization_metadata_bits:
         logger.info(
             "%s NETWORK QAT METADATA BIT | scales, zero-points and shapes: "
@@ -584,7 +615,7 @@ def build_compression_model(args, device):
         bits = args.network_quant_bits
         prepare_network_qat(model, bits, excluded_parameters=grid_parameters)
         model.network_quant_bits = bits
-        model.architecture = 'hybrid_grid_compressed_network_qat_v1'
+        model.architecture = 'hybrid_grid_compressed_mixed_qat_v2'
     return model.to(device)
 
 
@@ -876,7 +907,7 @@ def build_parser():
     parser.add_argument('--quant_step', type=float, default=1e-3)
     parser.add_argument(
         '--network_qat', action='store_true',
-        help='对非 Grid 参数启用训练中模拟量化',
+        help='对非 Grid 的二维 Linear 权重启用按输出通道模拟量化',
     )
     parser.add_argument('--network_quant_bits', type=int, default=8)
     parser.add_argument('--network_quant_start_epoch', type=int, default=30)
