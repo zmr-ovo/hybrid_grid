@@ -249,6 +249,7 @@ def _enable_only(model, selected):
     if not selected_ids:
         raise ValueError("selected parameter group must not be empty")
     for parameter in model.parameters():
+        parameter.grad = None
         parameter.requires_grad_(id(parameter) in selected_ids)
 
 

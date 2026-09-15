@@ -16,6 +16,7 @@
 - 分层全 GOP 模型组装：一份 GOP0 共享模型、一份供所有后续 GOP 使用的公共 LoRA，以及每个后续 GOP 的独立 LoRA。
 - 分层模型的公共/独立参数统计与路由单元测试。
 - 公共训练阶段和独立训练阶段的参数冻结接口，以及 optimizer step更新隔离测试。
+- `train_gop_hierarchical.py` 分层训练入口：公共 LoRA训练、逐 GOP独立 LoRA训练、完整验证、checkpoint、断点恢复和 eval-only。
 
 已有实验表明：只依靠由 GOP0 训练的共享模型和独立 LoRA，后续 GOP 需要独自承担过多内容变化；Grid 是影响后续 GOP 适配能力的重要部分。因此，下一步不再更新共享模型，而是在共享模型与独立 LoRA之间增加一份后续 GOP公共 LoRA。
 
@@ -161,6 +162,7 @@ configure_local_training(model, gop_index)
 - 全视频指标按照实际帧数加权，最后一个较短 GOP不能与完整 GOP拥有相同权重。
 - 分别报告 GOP0、每个后续 GOP和全视频的 PSNR、MS-SSIM。
 - 阶段 C训练一个 GOP时，仍需评测完整视频，检查是否错误影响其他 GOP。
+- 已实现完整视频一次前向评测，并从同一结果中计算阶段选择指标：公共阶段以所有后续 GOP的帧数加权 PSNR选择最佳模型，独立阶段以当前 GOP的 PSNR选择最佳模型。
 
 ### 3.7 参数量与预算
 
@@ -190,6 +192,8 @@ Bunny第一轮实验以全视频基线约2.78M总参数为目标：
 - 从公共 LoRA阶段恢复。
 - 从任意 GOP独立训练阶段恢复。
 - `eval-only`评测中间或最终 checkpoint。
+
+以上内容已实现。入口支持 `--stage all/common/local/eval`、`--target_gops`、`--hierarchical_checkpoint` 和 `--resume`；保存 `common_best/latest.pth`、`gop_k_best/latest.pth` 与 `final.pth`。
 
 ### 3.9 日志
 
@@ -312,7 +316,7 @@ Bunny第一轮实验以全视频基线约2.78M总参数为目标：
 
 1. 完成分层全 GOP模型组装与路由测试。已完成，等待服务器 PyTorch环境验证。
 2. 实现公共阶段和独立阶段的参数冻结接口，并增加真实 optimizer step隔离测试。已完成，等待服务器 PyTorch环境验证。
-3. 新增 `train_gop_hierarchical.py` 最小训练入口，只实现公共阶段与独立阶段的训练遍历。
+3. 新增 `train_gop_hierarchical.py` 最小训练入口，只实现公共阶段与独立阶段的训练遍历。已完成，等待服务器 PyTorch环境验证。
 4. 增加分 GOP及完整视频指标汇总。
 5. 增加 checkpoint、断点恢复、`eval-only`和完整参数统计。
 6. 在 Bunny上运行10轮公共 LoRA加5轮独立 LoRA的 smoke test。
@@ -329,14 +333,14 @@ Bunny第一轮实验以全视频基线约2.78M总参数为目标：
 
 下一步只实现：
 
-> 新增独立的 `train_gop_hierarchical.py` 最小训练入口，完成公共 LoRA阶段与逐 GOP独立 LoRA阶段的数据遍历、损失反向传播和学习率配置。
+> 为分层训练入口增加分 GOP训练指标与完整视频验证指标汇总，明确区分公共 LoRA阶段和各独立 LoRA阶段的结果。
 
 本步不实现：
 
 - checkpoint、断点恢复或 `eval-only`。
-- 完整视频指标汇总和图片导出。
+- 图片导出。
 - 自动 rank分配或预算搜索。
 - 熵模型、量化和算术编码。
 - 多 GPU并行。
 
-本地可以继续实现该入口；恢复服务器连接后，应先运行上述单元测试，通过后再启动 smoke test。
+恢复服务器连接后，应先运行模型组装、参数隔离和最小训练入口测试；通过后再继续 smoke test。
