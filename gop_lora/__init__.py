@@ -30,6 +30,13 @@ from .model import (
     GOPLoRAHybridGridNet,
     gop_local_coordinates,
 )
+from .joint import (
+    AllGOPParameterGroups,
+    GOPAdapterParameterGroup,
+    all_gop_parameter_groups,
+    assemble_all_gop_model,
+    parameter_count,
+)
 from .video_dataset import GOPVideoDataset
 
 __all__ = [
@@ -43,6 +50,8 @@ __all__ = [
     'GOPGridResidualHybridGridNet',
     'GOPLowRankGridHybridGridNet',
     'GOPStructuredGridHybridGridNet',
+    'GOPAdapterParameterGroup',
+    'AllGOPParameterGroups',
     'GOPGridResiduals',
     'GOPLowRankGridResiduals',
     'GOPStructuredGridResiduals',
@@ -52,6 +61,9 @@ __all__ = [
     'StructuredGridResidualLevel',
     'StructuredGridResidualSet',
     'gop_local_coordinates',
+    'assemble_all_gop_model',
+    'all_gop_parameter_groups',
+    'parameter_count',
     'GOPVideoDataset',
     'freeze_shared_parameters',
     'freeze_for_gop',
