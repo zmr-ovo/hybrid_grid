@@ -1,9 +1,61 @@
 import torch
 from torch import nn
 
-from model import Decoder, HybridGridNet
+from model import Decoder, HybridGridNet, TemporalModulation
 
 from .linear import GOPLoRALinear
+
+
+def _lora_linear(linear, num_gops, rank, alpha):
+    effective_rank = min(rank, linear.in_features, linear.out_features)
+    effective_alpha = float(alpha) * effective_rank / rank
+    return GOPLoRALinear(
+        linear, num_gops, effective_rank, effective_alpha,
+    )
+
+
+class GOPLoRAGate(nn.Module):
+    """Route a gated Linear projection through one adapter per later GOP."""
+
+    def __init__(self, shared_gate, num_gops, rank, alpha):
+        super().__init__()
+        if (not isinstance(shared_gate, nn.Sequential)
+                or len(shared_gate) != 2
+                or not isinstance(shared_gate[0], nn.Linear)):
+            raise TypeError("shared_gate must be Linear followed by activation")
+        self.linear = _lora_linear(
+            shared_gate[0], num_gops, rank, alpha,
+        )
+        self.activation = shared_gate[1]
+
+    def forward(self, inputs, gop_index):
+        return self.activation(self.linear(inputs, gop_index))
+
+
+class GOPLoRATemporalModulation(nn.Module):
+    """Temporal modulation whose two Linear layers use GOP adapters."""
+
+    def __init__(self, shared_module, num_gops, rank, alpha):
+        super().__init__()
+        if not isinstance(shared_module, TemporalModulation):
+            raise TypeError("shared_module must be TemporalModulation")
+        self.first = _lora_linear(
+            shared_module.mlp[0], num_gops, rank, alpha,
+        )
+        self.activation = shared_module.mlp[1]
+        self.second = _lora_linear(
+            shared_module.mlp[2], num_gops, rank, alpha,
+        )
+        self.norm = shared_module.norm
+
+    def forward(self, inputs, coords, gop_index):
+        batch, channels, _, _ = inputs.shape
+        time = coords[:, 2, 0, 0].unsqueeze(1)
+        hidden = self.activation(self.first(time, gop_index))
+        gamma, beta = self.second(hidden, gop_index).chunk(2, dim=1)
+        gamma = gamma.view(batch, channels, 1, 1)
+        beta = beta.view(batch, channels, 1, 1)
+        return self.norm(inputs) * gamma + beta
 
 
 class GOPLoRADecoder(nn.Module):
@@ -20,18 +72,12 @@ class GOPLoRADecoder(nn.Module):
         self.rank = rank
         self.alpha = float(alpha)
         self.linear = nn.ModuleList([
-            GOPLoRALinear(layer, num_gops, rank, alpha)
+            _lora_linear(layer, num_gops, rank, alpha)
             for layer in shared_decoder.linear
         ])
         output_linear = shared_decoder.output_layer[0]
-        output_rank = min(
-            rank, output_linear.in_features, output_linear.out_features,
-        )
-        output_alpha = self.alpha * output_rank / rank
         self.output_layer = nn.ModuleList([
-            GOPLoRALinear(
-                output_linear, num_gops, output_rank, output_alpha,
-            ),
+            _lora_linear(output_linear, num_gops, rank, alpha),
             shared_decoder.output_layer[1],
         ])
         self.act = shared_decoder.act
@@ -54,24 +100,43 @@ class GOPLoRADecoder(nn.Module):
 
 
 def inject_gop_lora(model, num_gops, rank, alpha=1.0, target='decoder'):
-    """Add one independent adapter per later GOP to each Decoder layer."""
+    """Add independent later-GOP adapters to Decoder or every Linear layer."""
     if not isinstance(model, HybridGridNet):
         raise TypeError("model must be HybridGridNet")
-    if target != 'decoder':
-        raise ValueError("only target='decoder' is currently supported")
+    if target not in ('decoder', 'all_linear'):
+        raise ValueError("target must be 'decoder' or 'all_linear'")
     if isinstance(model.decoder, GOPLoRADecoder):
         raise ValueError("GOP LoRA has already been injected")
     if not isinstance(model.decoder, Decoder):
         raise ValueError("model does not contain the paper Decoder")
 
+    names = []
+    if target == 'all_linear':
+        model.gate_grid = GOPLoRAGate(
+            model.gate_grid, num_gops, rank, alpha,
+        )
+        model.gate_pe = GOPLoRAGate(
+            model.gate_pe, num_gops, rank, alpha,
+        )
+        model.time_mod = GOPLoRATemporalModulation(
+            model.time_mod, num_gops, rank, alpha,
+        )
+        names.extend((
+            'gate_grid.linear',
+            'gate_pe.linear',
+            'time_mod.first',
+            'time_mod.second',
+        ))
+
     model.decoder = GOPLoRADecoder(
         model.decoder, num_gops=num_gops, rank=rank, alpha=alpha,
     )
-    return tuple(
+    names.extend(
         ['decoder.linear.{}'.format(index)
          for index in range(len(model.decoder.linear))]
         + ['decoder.output_layer.0']
     )
+    return tuple(names)
 
 
 def gop_lora_layers(model):
@@ -113,3 +178,23 @@ def freeze_shared_parameters(model):
         parameter.requires_grad_(False)
     for parameter in lora_parameters(model):
         parameter.requires_grad_(True)
+
+
+def gop_adaptation_parameters(model, gop_index):
+    parameters = list(gop_parameters(model, gop_index))
+    grid_residuals = getattr(model, 'grid_residuals', None)
+    if grid_residuals is not None:
+        parameters.extend(grid_residuals.gop_parameters(gop_index))
+    return tuple(parameters)
+
+
+def freeze_for_gop(model, gop_index):
+    """Freeze the anchor and enable only one GOP's adaptation parameters."""
+    parameters = gop_adaptation_parameters(model, gop_index)
+    if not parameters:
+        raise ValueError("the selected GOP has no adaptation parameters")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in parameters:
+        parameter.requires_grad_(True)
+    return parameters

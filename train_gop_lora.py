@@ -324,10 +324,10 @@ def set_learning_rate(optimizer, base_lr, epoch, batch_index, num_batches,
         span = max(epochs - warmup_epochs, 1.0)
         progress = min(max((position - warmup_epochs) / span, 0.0), 1.0)
         multiplier = 0.5 * (1.0 + math.cos(math.pi * progress))
-    learning_rate = base_lr * multiplier
     for group in optimizer.param_groups:
-        group['lr'] = learning_rate
-    return learning_rate
+        group_base_lr = group.get('base_lr', base_lr)
+        group['lr'] = group_base_lr * multiplier
+    return base_lr * multiplier
 
 
 def _forward(model, batch, device, adapter_stage):

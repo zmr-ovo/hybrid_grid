@@ -4,6 +4,8 @@ import torch
 
 from gop_lora.injection import (
     GOPLoRADecoder,
+    GOPLoRAGate,
+    GOPLoRATemporalModulation,
     freeze_shared_parameters,
     gop_lora_layers,
     gop_parameters,
@@ -66,6 +68,24 @@ class GOPLoRAInjectionTest(unittest.TestCase):
         self.assertFalse(any('gate_' in name for name in lora_names))
         self.assertFalse(any('time_mod' in name for name in lora_names))
 
+    def test_can_inject_every_linear_layer(self):
+        model = make_model()
+
+        names = inject_gop_lora(
+            model, num_gops=2, rank=8, alpha=8,
+            target='all_linear',
+        )
+
+        self.assertEqual(len(names), 9)
+        self.assertIsInstance(model.gate_grid, GOPLoRAGate)
+        self.assertIsInstance(model.gate_pe, GOPLoRAGate)
+        self.assertIsInstance(model.time_mod, GOPLoRATemporalModulation)
+        self.assertIsInstance(model.decoder, GOPLoRADecoder)
+        self.assertEqual(len(gop_lora_layers(model)), 9)
+        self.assertTrue(all(
+            layer.scaling == 1.0 for layer in gop_lora_layers(model)
+        ))
+
     def test_caps_only_the_rgb_output_rank_and_preserves_scaling(self):
         model = make_model()
 
@@ -116,7 +136,7 @@ class GOPLoRAInjectionTest(unittest.TestCase):
 
     def test_rejects_duplicate_or_unsupported_injection(self):
         model = make_model()
-        with self.assertRaisesRegex(ValueError, 'only target'):
+        with self.assertRaisesRegex(ValueError, 'target must'):
             inject_gop_lora(model, 2, 1, target='gate')
 
         inject_gop_lora(model, 2, 1)

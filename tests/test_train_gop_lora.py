@@ -14,6 +14,7 @@ from train_gop_lora import (
     load_anchor_checkpoint,
     save_adapter_checkpoint,
     save_anchor_checkpoint,
+    set_learning_rate,
 )
 
 
@@ -77,6 +78,19 @@ class GOPCheckpointTest(unittest.TestCase):
         self.assertEqual(progress, (5, 31.0, 32.0))
         for expected, actual in zip(model.parameters(), restored.parameters()):
             self.assertTrue(torch.equal(expected, actual))
+
+    def test_learning_rate_supports_independent_parameter_groups(self):
+        first = torch.nn.Parameter(torch.zeros(()))
+        second = torch.nn.Parameter(torch.zeros(()))
+        optimizer = torch.optim.AdamW([
+            {'params': (first,), 'base_lr': 5e-3},
+            {'params': (second,), 'base_lr': 1e-3},
+        ])
+
+        set_learning_rate(optimizer, 5e-3, 0, 0, 1, 10, 0.0)
+
+        self.assertEqual(optimizer.param_groups[0]['lr'], 5e-3)
+        self.assertEqual(optimizer.param_groups[1]['lr'], 1e-3)
 
     def test_adapter_checkpoint_contains_only_lora_parameters(self):
         anchor = make_anchor()

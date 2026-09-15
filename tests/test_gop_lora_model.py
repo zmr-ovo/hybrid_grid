@@ -50,6 +50,19 @@ class GOPLoRAModelTest(unittest.TestCase):
         self.assertTrue(torch.equal(actual, expected))
         self.assertIs(model.shared_model, shared)
 
+    def test_all_linear_zero_initialization_matches_the_paper_model(self):
+        baseline = make_model()
+        model = GOPLoRAHybridGridNet(
+            copy.deepcopy(baseline), num_gops=2, rank=2,
+            alpha=2, lora_target='all_linear',
+        )
+        coords = torch.rand(1, 3, 3, 4)
+
+        expected = baseline(with_local_time(coords, 0.25))
+        actual = model(coords, gop_index=1, gop_local_time=0.25)
+
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_adapter_change_only_affects_its_own_gop(self):
         baseline = make_model()
         shared = copy.deepcopy(baseline)
