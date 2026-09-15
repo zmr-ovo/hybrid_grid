@@ -7,10 +7,12 @@ from .grid_residual import (
     GOPGridResiduals,
     GOPLowRankGridResiduals,
     GOPStructuredGridResiduals,
+    HierarchicalGOPStructuredGridResiduals,
 )
 from .injection import (
     GOPLoRAGate,
     GOPLoRATemporalModulation,
+    hierarchical_lora_factory,
     inject_gop_lora,
 )
 
@@ -55,17 +57,21 @@ class GOPLoRAHybridGridNet(nn.Module):
     architecture = 'hybrid_grid_anchor_gop_lora_v1'
 
     def __init__(self, shared_model, num_gops, rank, alpha=1.0,
-                 lora_target='decoder'):
+                 lora_target='decoder', linear_factory=None):
         super().__init__()
         if not isinstance(shared_model, HybridGridNet):
             raise TypeError("shared_model must be HybridGridNet")
 
-        self.injected_layers = inject_gop_lora(
-            shared_model,
+        injection_args = dict(
             num_gops=num_gops,
             rank=rank,
             alpha=alpha,
             target=lora_target,
+        )
+        if linear_factory is not None:
+            injection_args['linear_factory'] = linear_factory
+        self.injected_layers = inject_gop_lora(
+            shared_model, **injection_args
         )
         self.shared_model = shared_model
         self.num_gops = num_gops
@@ -233,6 +239,67 @@ class GOPStructuredGridHybridGridNet(GOPLoRAHybridGridNet):
 
     def grid_parameters(self, gop_index):
         return self.grid_residuals.gop_parameters(gop_index)
+
+    def grid_lora_levels(self, gop_index):
+        return self.grid_residuals.gop_levels(gop_index)
+
+
+class HierarchicalGOPHybridGridNet(GOPLoRAHybridGridNet):
+    """Combine shared weights with common and per-GOP local LoRA."""
+
+    architecture = 'hybrid_grid_hierarchical_gop_lora_v1'
+
+    def __init__(self, shared_model, num_gops, rank, alpha,
+                 grid_rank, grid_alpha, common_rank, common_alpha,
+                 common_grid_rank, common_grid_alpha):
+        super().__init__(
+            shared_model=shared_model,
+            num_gops=num_gops,
+            rank=rank,
+            alpha=alpha,
+            lora_target='all_linear',
+            linear_factory=hierarchical_lora_factory(
+                common_rank, common_alpha,
+            ),
+        )
+        grids = tuple(
+            level.grid for level in self.shared_model.grid_encoder.levels
+        )
+        self.grid_residuals = HierarchicalGOPStructuredGridResiduals(
+            grids=grids,
+            num_gops=num_gops,
+            adapted_gops=range(1, num_gops),
+            rank=grid_rank,
+            alpha=grid_alpha,
+            common_rank=common_grid_rank,
+            common_alpha=common_grid_alpha,
+        )
+        self.common_rank = common_rank
+        self.common_alpha = float(common_alpha)
+        self.grid_rank = grid_rank
+        self.grid_alpha = float(grid_alpha)
+        self.common_grid_rank = common_grid_rank
+        self.common_grid_alpha = float(common_grid_alpha)
+        self.architecture = 'hybrid_grid_hierarchical_gop_lora_v1'
+
+    def forward(self, coords, gop_index, gop_local_time, grids=None):
+        if grids is None:
+            grids = tuple(
+                level.grid for level in self.shared_model.grid_encoder.levels
+            )
+        adapted_grids = self.grid_residuals(grids, gop_index)
+        return super().forward(
+            coords, gop_index, gop_local_time, grids=adapted_grids,
+        )
+
+    def common_grid_parameters(self):
+        return self.grid_residuals.common_parameters()
+
+    def grid_parameters(self, gop_index):
+        return self.grid_residuals.gop_parameters(gop_index)
+
+    def common_grid_levels(self):
+        return self.grid_residuals.common_levels()
 
     def grid_lora_levels(self, gop_index):
         return self.grid_residuals.gop_levels(gop_index)

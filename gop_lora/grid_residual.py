@@ -369,3 +369,45 @@ class GOPStructuredGridResiduals(nn.Module):
                 "GOP {} has no structured Grid LoRA".format(gop_index)
             )
         return tuple(self.residuals[key].levels)
+
+
+class HierarchicalGOPStructuredGridResiduals(GOPStructuredGridResiduals):
+    """Add one common later-GOP Grid LoRA before each local Grid LoRA."""
+
+    def __init__(self, grids, num_gops, adapted_gops, rank, alpha,
+                 common_rank, common_alpha):
+        grids = tuple(grids)
+        super().__init__(
+            grids, num_gops, adapted_gops, rank, alpha,
+        )
+        self.common = StructuredGridResidualSet(
+            grids, common_rank, common_alpha,
+        )
+        self.common_rank = common_rank
+        self.common_alpha = float(common_alpha)
+
+    def forward(self, grids, gop_index):
+        grids = tuple(grids)
+        gop_index = _gop_index(gop_index)
+        if not 0 <= gop_index < self.num_gops:
+            raise IndexError("gop_index is outside the available GOPs")
+        if gop_index == 0:
+            return grids
+
+        if len(grids) != len(self.common.levels):
+            raise ValueError("Grid level count does not match Grid LoRA")
+        common_grids = tuple(
+            level(grid)
+            for level, grid in zip(self.common.levels, grids)
+        )
+        return super().forward(common_grids, gop_index)
+
+    def common_parameters(self):
+        return tuple(
+            parameter
+            for level in self.common.levels
+            for parameter in level.lora_parameters()
+        )
+
+    def common_levels(self):
+        return tuple(self.common.levels)

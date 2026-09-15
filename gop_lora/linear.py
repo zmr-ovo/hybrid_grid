@@ -116,3 +116,70 @@ class GOPLoRALinear(nn.Module):
             self.rank,
             self.alpha,
         )
+
+
+class HierarchicalGOPLoRALinear(GOPLoRALinear):
+    """Use one common later-GOP adapter and one local adapter per GOP."""
+
+    def __init__(self, shared_linear, num_gops, rank, alpha,
+                 common_rank, common_alpha):
+        super().__init__(shared_linear, num_gops, rank, alpha)
+        self.common_rank = _positive_integer('common_rank', common_rank)
+        if self.common_rank > min(
+            shared_linear.in_features, shared_linear.out_features,
+        ):
+            raise ValueError(
+                "common_rank must not exceed the linear dimensions"
+            )
+        if (isinstance(common_alpha, bool)
+                or not isinstance(common_alpha, Real)
+                or not math.isfinite(common_alpha) or common_alpha <= 0):
+            raise ValueError("common_alpha must be finite and positive")
+
+        self.common_alpha = float(common_alpha)
+        self.common_scaling = self.common_alpha / self.common_rank
+        self.common_a = nn.Parameter(shared_linear.weight.new_empty(
+            self.common_rank, shared_linear.in_features,
+        ))
+        self.common_b = nn.Parameter(shared_linear.weight.new_zeros(
+            shared_linear.out_features, self.common_rank,
+        ))
+        nn.init.kaiming_uniform_(self.common_a, a=math.sqrt(5))
+
+    def forward(self, inputs, gop_index):
+        if not torch.is_tensor(inputs):
+            raise TypeError("inputs must be a torch.Tensor")
+        if inputs.shape[-1] != self.in_features:
+            raise ValueError("inputs have an unexpected feature dimension")
+        gop_index = self._normalize_gop_index(gop_index)
+
+        base = self.shared(inputs)
+        if gop_index == 0:
+            return base
+
+        adapter_index = gop_index - 1
+        common = F.linear(F.linear(inputs, self.common_a), self.common_b)
+        local = F.linear(
+            F.linear(inputs, self.lora_a[adapter_index]),
+            self.lora_b[adapter_index],
+        )
+        return (
+            base
+            + common * self.common_scaling
+            + local * self.scaling
+        )
+
+    def common_parameters(self):
+        return self.common_a, self.common_b
+
+    def local_parameters(self, gop_index):
+        return super().gop_parameters(gop_index)
+
+    def lora_parameters(self):
+        return self.common_parameters() + super().lora_parameters()
+
+    def extra_repr(self):
+        return (
+            super().extra_repr()
+            + ', common_rank={}, common_alpha={}'
+        ).format(self.common_rank, self.common_alpha)

@@ -1,5 +1,5 @@
 from .partition import FixedGOPPartition, GOPPosition
-from .linear import GOPLoRALinear
+from .linear import GOPLoRALinear, HierarchicalGOPLoRALinear
 from .injection import (
     GOPLoRADecoder,
     GOPLoRAGate,
@@ -17,6 +17,7 @@ from .grid_residual import (
     GOPGridResiduals,
     GOPLowRankGridResiduals,
     GOPStructuredGridResiduals,
+    HierarchicalGOPStructuredGridResiduals,
     GridResidualSet,
     LowRankGridResidualLevel,
     LowRankGridResidualSet,
@@ -28,13 +29,17 @@ from .model import (
     GOPLowRankGridHybridGridNet,
     GOPStructuredGridHybridGridNet,
     GOPLoRAHybridGridNet,
+    HierarchicalGOPHybridGridNet,
     gop_local_coordinates,
 )
 from .joint import (
     AllGOPParameterGroups,
     GOPAdapterParameterGroup,
+    TrainableLoRAParameters,
     all_gop_parameter_groups,
     assemble_all_gop_model,
+    configure_common_training,
+    configure_local_training,
     parameter_count,
 )
 from .video_dataset import GOPVideoDataset
@@ -43,6 +48,7 @@ __all__ = [
     'FixedGOPPartition',
     'GOPPosition',
     'GOPLoRALinear',
+    'HierarchicalGOPLoRALinear',
     'GOPLoRADecoder',
     'GOPLoRAGate',
     'GOPLoRATemporalModulation',
@@ -50,11 +56,14 @@ __all__ = [
     'GOPGridResidualHybridGridNet',
     'GOPLowRankGridHybridGridNet',
     'GOPStructuredGridHybridGridNet',
+    'HierarchicalGOPHybridGridNet',
     'GOPAdapterParameterGroup',
     'AllGOPParameterGroups',
+    'TrainableLoRAParameters',
     'GOPGridResiduals',
     'GOPLowRankGridResiduals',
     'GOPStructuredGridResiduals',
+    'HierarchicalGOPStructuredGridResiduals',
     'GridResidualSet',
     'LowRankGridResidualLevel',
     'LowRankGridResidualSet',
@@ -63,6 +72,8 @@ __all__ = [
     'gop_local_coordinates',
     'assemble_all_gop_model',
     'all_gop_parameter_groups',
+    'configure_common_training',
+    'configure_local_training',
     'parameter_count',
     'GOPVideoDataset',
     'freeze_shared_parameters',

@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from numbers import Real
 
 from .injection import gop_parameters
-from .model import GOPStructuredGridHybridGridNet
+from .linear import HierarchicalGOPLoRALinear
+from .model import HierarchicalGOPHybridGridNet
 
 
 def _positive_integer(name, value):
@@ -26,7 +27,7 @@ def parameter_count(parameters):
 
 @dataclass(frozen=True)
 class GOPAdapterParameterGroup:
-    """Network and structured Grid LoRA parameters for one later GOP."""
+    """Independent network and structured Grid LoRA for one later GOP."""
 
     gop_index: int
     network: tuple
@@ -51,9 +52,11 @@ class GOPAdapterParameterGroup:
 
 @dataclass(frozen=True)
 class AllGOPParameterGroups:
-    """Non-overlapping parameter groups for an assembled all-GOP model."""
+    """Complete parameter groups for the hierarchical all-GOP model."""
 
     shared: tuple
+    common_network: tuple
+    common_grid: tuple
     adapters: tuple
 
     def for_gop(self, gop_index):
@@ -65,7 +68,11 @@ class AllGOPParameterGroups:
         )
 
     @property
-    def network(self):
+    def common(self):
+        return self.common_network + self.common_grid
+
+    @property
+    def local_network(self):
         return tuple(
             parameter
             for adapter in self.adapters
@@ -73,7 +80,7 @@ class AllGOPParameterGroups:
         )
 
     @property
-    def grid(self):
+    def local_grid(self):
         return tuple(
             parameter
             for adapter in self.adapters
@@ -81,7 +88,7 @@ class AllGOPParameterGroups:
         )
 
     @property
-    def adaptation(self):
+    def local(self):
         return tuple(
             parameter
             for adapter in self.adapters
@@ -90,36 +97,62 @@ class AllGOPParameterGroups:
 
     @property
     def parameters(self):
-        return self.shared + self.adaptation
+        return self.shared + self.common + self.local
 
     @property
     def shared_count(self):
         return parameter_count(self.shared)
 
     @property
-    def network_count(self):
-        return parameter_count(self.network)
+    def common_network_count(self):
+        return parameter_count(self.common_network)
 
     @property
-    def grid_count(self):
-        return parameter_count(self.grid)
+    def common_grid_count(self):
+        return parameter_count(self.common_grid)
+
+    @property
+    def common_count(self):
+        return self.common_network_count + self.common_grid_count
+
+    @property
+    def local_network_count(self):
+        return parameter_count(self.local_network)
+
+    @property
+    def local_grid_count(self):
+        return parameter_count(self.local_grid)
+
+    @property
+    def local_count(self):
+        return self.local_network_count + self.local_grid_count
 
     @property
     def adaptation_count(self):
-        return self.network_count + self.grid_count
+        return self.common_count + self.local_count
 
     @property
     def total_count(self):
         return self.shared_count + self.adaptation_count
 
 
-def assemble_all_gop_model(shared_model, num_gops, rank, alpha,
-                           grid_rank, grid_alpha):
-    """Attach independent network and structured Grid LoRA to every later GOP.
+@dataclass(frozen=True)
+class TrainableLoRAParameters:
+    """Network and Grid parameters enabled for one training stage."""
 
-    GOP 0 uses the shared model directly. GOP 1 through ``num_gops - 1`` each
-    receive their own all-Linear network LoRA and structured Grid LoRA.
-    """
+    network: tuple
+    grid: tuple
+
+    @property
+    def parameters(self):
+        return self.network + self.grid
+
+
+def assemble_all_gop_model(shared_model, num_gops, rank, alpha,
+                           grid_rank, grid_alpha, common_rank=None,
+                           common_alpha=None, common_grid_rank=None,
+                           common_grid_alpha=None):
+    """Assemble the shared, common and independent GOP model hierarchy."""
     _positive_integer('num_gops', num_gops)
     if num_gops < 2:
         raise ValueError("num_gops must be at least two")
@@ -128,29 +161,52 @@ def assemble_all_gop_model(shared_model, num_gops, rank, alpha,
     _positive_integer('grid_rank', grid_rank)
     _positive_number('grid_alpha', grid_alpha)
 
-    return GOPStructuredGridHybridGridNet(
+    common_rank = rank if common_rank is None else common_rank
+    common_alpha = alpha if common_alpha is None else common_alpha
+    common_grid_rank = (
+        grid_rank if common_grid_rank is None else common_grid_rank
+    )
+    common_grid_alpha = (
+        grid_alpha if common_grid_alpha is None else common_grid_alpha
+    )
+    _positive_integer('common_rank', common_rank)
+    _positive_number('common_alpha', common_alpha)
+    _positive_integer('common_grid_rank', common_grid_rank)
+    _positive_number('common_grid_alpha', common_grid_alpha)
+
+    return HierarchicalGOPHybridGridNet(
         shared_model=shared_model,
         num_gops=num_gops,
-        adapted_gops=range(1, num_gops),
         rank=rank,
         alpha=alpha,
         grid_rank=grid_rank,
         grid_alpha=grid_alpha,
-        lora_target='all_linear',
+        common_rank=common_rank,
+        common_alpha=common_alpha,
+        common_grid_rank=common_grid_rank,
+        common_grid_alpha=common_grid_alpha,
     )
 
 
 def all_gop_parameter_groups(model):
-    """Collect complete, disjoint shared and per-GOP parameter groups."""
-    if not isinstance(model, GOPStructuredGridHybridGridNet):
-        raise TypeError(
-            "model must be GOPStructuredGridHybridGridNet"
-        )
+    """Collect disjoint shared, common and independent GOP parameters."""
+    if not isinstance(model, HierarchicalGOPHybridGridNet):
+        raise TypeError("model must be HierarchicalGOPHybridGridNet")
 
     expected_gops = tuple(range(1, model.num_gops))
     if model.grid_residuals.adapted_gops != expected_gops:
         raise ValueError("model does not contain Grid LoRA for every later GOP")
 
+    network_layers = tuple(
+        module for module in model.modules()
+        if isinstance(module, HierarchicalGOPLoRALinear)
+    )
+    common_network = tuple(
+        parameter
+        for layer in network_layers
+        for parameter in layer.common_parameters()
+    )
+    common_grid = tuple(model.common_grid_parameters())
     adapters = tuple(
         GOPAdapterParameterGroup(
             gop_index=gop_index,
@@ -159,25 +215,61 @@ def all_gop_parameter_groups(model):
         )
         for gop_index in expected_gops
     )
-    adaptation_ids = {
-        id(parameter)
+    local = tuple(
+        parameter
         for adapter in adapters
         for parameter in adapter.parameters
-    }
-    adaptation_size = sum(
-        len(adapter.parameters) for adapter in adapters
     )
-    if len(adaptation_ids) != adaptation_size:
-        raise RuntimeError("adapter parameter groups overlap")
+    adaptation = common_network + common_grid + local
+    adaptation_ids = {id(parameter) for parameter in adaptation}
+    if len(adaptation_ids) != len(adaptation):
+        raise RuntimeError("LoRA parameter groups overlap")
 
     model_parameters = tuple(model.parameters())
     shared = tuple(
         parameter for parameter in model_parameters
         if id(parameter) not in adaptation_ids
     )
-    groups = AllGOPParameterGroups(shared=shared, adapters=adapters)
-    if {id(parameter) for parameter in groups.parameters} != {
-        id(parameter) for parameter in model_parameters
-    }:
+    groups = AllGOPParameterGroups(
+        shared=shared,
+        common_network=common_network,
+        common_grid=common_grid,
+        adapters=adapters,
+    )
+    grouped_ids = [id(parameter) for parameter in groups.parameters]
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise RuntimeError("parameter groups overlap")
+    if set(grouped_ids) != {id(parameter) for parameter in model_parameters}:
         raise RuntimeError("parameter groups do not cover the complete model")
     return groups
+
+
+def _enable_only(model, selected):
+    selected_ids = {id(parameter) for parameter in selected}
+    if not selected_ids:
+        raise ValueError("selected parameter group must not be empty")
+    for parameter in model.parameters():
+        parameter.requires_grad_(id(parameter) in selected_ids)
+
+
+def configure_common_training(model):
+    """Freeze the shared and local parameters, then enable common LoRA."""
+    groups = all_gop_parameter_groups(model)
+    selected = TrainableLoRAParameters(
+        network=groups.common_network,
+        grid=groups.common_grid,
+    )
+    _enable_only(model, selected.parameters)
+    return selected
+
+
+def configure_local_training(model, gop_index):
+    """Enable only one later GOP's independent network and Grid LoRA."""
+    groups = all_gop_parameter_groups(model)
+    adapter = groups.for_gop(gop_index)
+    selected = TrainableLoRAParameters(
+        network=adapter.network,
+        grid=adapter.grid,
+    )
+    _enable_only(model, selected.parameters)
+    return selected
