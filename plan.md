@@ -17,6 +17,7 @@
 - 分层模型的公共/独立参数统计与路由单元测试。
 - 公共训练阶段和独立训练阶段的参数冻结接口，以及 optimizer step更新隔离测试。
 - `train_gop_hierarchical.py` 分层训练入口：公共 LoRA训练、逐 GOP独立 LoRA训练、完整验证、checkpoint、断点恢复和 eval-only。
+- `evaluate_global_gop.py` 全局时间模型的逐 GOP评测入口：直接加载 `train.py` checkpoint，输出逐 GOP与全视频指标及 JSON/TXT报告。
 
 已有实验表明：只依靠由 GOP0 训练的共享模型和独立 LoRA，后续 GOP 需要独自承担过多内容变化；Grid 是影响后续 GOP 适配能力的重要部分。因此，下一步不再更新共享模型，而是在共享模型与独立 LoRA之间增加一份后续 GOP公共 LoRA。
 
