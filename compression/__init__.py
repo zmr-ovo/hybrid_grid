@@ -1,3 +1,4 @@
+from .conditional_entropy import CrossScaleConditionalEntropy
 from .entropy_bottleneck import EntropyBottleneck
 from .model import CompressedHybridGridNet, CompressedModelOutput
 from .network_quantization import (
@@ -19,6 +20,7 @@ from .rate import (
 )
 
 __all__ = [
+    'CrossScaleConditionalEntropy',
     'EntropyBottleneck',
     'CompressedHybridGridNet',
     'CompressedModelOutput',

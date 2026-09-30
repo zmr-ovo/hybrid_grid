@@ -40,6 +40,7 @@ def load_compression_model(checkpoint_path, device):
 
     config = Namespace(**saved_config)
     for name, value in (
+        ('entropy_model', 'factorized'),
         ('network_qat', False),
         ('network_quant_bits', 8),
         ('network_quant_start_epoch', 30),
@@ -117,17 +118,15 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
         'non_grid_uint{}'.format(qat_bits)
         if qat_enabled else 'non_grid_fp32'
     )
-    entropy_key = (
-        'entropy_model_uint{}'.format(qat_bits)
-        if qat_enabled else 'entropy_model_fp32'
-    )
+    entropy_key = 'entropy_model_fp32'
 
     report = {
-        'schema_version': 3,
+        'schema_version': 4,
         'checkpoint': str(Path(checkpoint_path).resolve()),
         'checkpoint_epoch': checkpoint_epoch,
         'quant_mode': 'symbols',
         'quant_step': config.quant_step,
+        'entropy_model': getattr(config, 'entropy_model', 'factorized'),
         'network_qat': {
             'enabled': qat_enabled,
             'bits': qat_bits if qat_enabled else None,
@@ -149,6 +148,7 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
             'time_scale': config.time_scale,
             'pe_freq': config.pe_freq,
             'hidden_dim': config.hidden_dim,
+            'entropy_model': getattr(config, 'entropy_model', 'factorized'),
         },
         'sequence': {
             'data_root': str(Path(data_root).resolve()),
@@ -220,7 +220,7 @@ def format_evaluation_report(report):
         'uint{}'.format(network_qat['bits']) if network_qat['enabled'] else 'fp32'
     )
     non_grid = rate['non_grid_' + storage_suffix]
-    entropy = rate['entropy_model_' + storage_suffix]
+    entropy = rate['entropy_model_fp32']
     payload = rate['estimated_payload_subtotal']
     metadata = rate['quantization_metadata']
     network_metadata = rate['network_quantization_metadata']
@@ -231,6 +231,7 @@ def format_evaluation_report(report):
         'Checkpoint epoch: {}'.format(report['checkpoint_epoch']),
         'Quant mode: symbols',
         'Quant step: {}'.format(report['quant_step']),
+        'Entropy model: {}'.format(report['entropy_model']),
         'Network QAT: {}'.format(
             '{}-bit'.format(network_qat['bits'])
             if network_qat['enabled'] else 'disabled'
@@ -263,7 +264,7 @@ def format_evaluation_report(report):
         'Size: {:.6f} MiB'.format(non_grid['mib']),
         'BPP: {:.8f}'.format(non_grid['bpp']),
         '',
-        'Entropy model {} side information'.format(storage_suffix.upper()),
+        'Entropy model FP32 side information',
         'Tensors: {}'.format(entropy['tensor_count']),
         'Parameters: {}'.format(entropy['parameter_count']),
         'Bits: {}'.format(entropy['bits']),

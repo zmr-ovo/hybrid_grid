@@ -3,6 +3,8 @@ import unittest
 import torch
 from torch import nn
 
+from compression.conditional_entropy import CrossScaleConditionalEntropy
+from compression.entropy_bottleneck import EntropyBottleneck
 from compression.model import CompressedHybridGridNet
 from model import HybridGridNet
 
@@ -28,6 +30,44 @@ class CompressedModelTest(unittest.TestCase):
         self.assertIsNot(model.entropy_models[0], model.entropy_models[1])
         self.assertTrue(all(
             entropy.channels == 2 for entropy in model.entropy_models
+        ))
+
+    def test_cross_scale_uses_factorized_base_and_conditional_higher_levels(self):
+        model = CompressedHybridGridNet(
+            make_baseline(), quant_steps=0.1, entropy_model='cross_scale',
+        )
+
+        self.assertEqual(model.entropy_model_type, 'cross_scale')
+        self.assertIsInstance(model.entropy_models[0], EntropyBottleneck)
+        self.assertIsInstance(
+            model.entropy_models[1], CrossScaleConditionalEntropy,
+        )
+        self.assertEqual(
+            model.architecture, 'hybrid_grid_compressed_cross_scale_v1',
+        )
+
+    def test_cross_scale_forward_and_gradients(self):
+        baseline = make_baseline()
+        model = CompressedHybridGridNet(
+            baseline, quant_steps=0.1, entropy_model='cross_scale',
+        )
+
+        output = model(torch.rand(1, 3, 4, 5), quant_mode='noise')
+        loss = output.reconstruction.mean() + output.rate.bits_per_value
+        loss.backward()
+
+        self.assertEqual(len(output.likelihoods), 2)
+        self.assertEqual(
+            output.likelihoods[1].shape,
+            baseline.grid_encoder.levels[1].grid.shape,
+        )
+        self.assertTrue(all(
+            level.grid.grad is not None
+            for level in baseline.grid_encoder.levels
+        ))
+        self.assertTrue(all(
+            parameter.grad is not None
+            for parameter in model.entropy_models.parameters()
         ))
 
     def test_disabled_mode_matches_baseline_exactly(self):
@@ -128,6 +168,12 @@ class CompressedModelTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, 'quant_mode'):
             model(torch.rand(1, 3, 2, 2), quant_mode='unknown')
+
+    def test_rejects_invalid_entropy_model(self):
+        with self.assertRaisesRegex(ValueError, 'entropy_model'):
+            CompressedHybridGridNet(
+                make_baseline(), quant_steps=0.1, entropy_model='unknown',
+            )
 
 
 if __name__ == '__main__':

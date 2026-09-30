@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from .conditional_entropy import CrossScaleConditionalEntropy
 from .entropy_bottleneck import EntropyBottleneck
 from .quantization import QUANTIZATION_MODES, quantize_grid
 from .rate import GridRateResult, estimate_grid_rate
@@ -31,6 +32,7 @@ class CompressedHybridGridNet(nn.Module):
         reconstruction_model,
         quant_steps=1e-3,
         entropy_filters=(3, 3, 3),
+        entropy_model='factorized',
     ):
         super().__init__()
         if not isinstance(reconstruction_model, nn.Module):
@@ -51,12 +53,34 @@ class CompressedHybridGridNet(nn.Module):
         ):
             raise ValueError("each Grid level must expose grid and n_features")
 
+        if entropy_model not in ('factorized', 'cross_scale'):
+            raise ValueError(
+                "entropy_model must be 'factorized' or 'cross_scale'"
+            )
+
         self.reconstruction_model = reconstruction_model
         self.quant_steps = self._normalize_quant_steps(quant_steps, len(levels))
-        self.entropy_models = nn.ModuleList([
-            EntropyBottleneck(level.n_features, filters=entropy_filters)
-            for level in levels
-        ])
+        self.entropy_model_type = entropy_model
+        if entropy_model == 'factorized':
+            self.entropy_models = nn.ModuleList([
+                EntropyBottleneck(level.n_features, filters=entropy_filters)
+                for level in levels
+            ])
+        else:
+            feature_dims = {level.n_features for level in levels}
+            if len(feature_dims) != 1:
+                raise ValueError(
+                    "cross_scale requires the same feature count at every level"
+                )
+            channels = levels[0].n_features
+            self.entropy_models = nn.ModuleList([
+                EntropyBottleneck(channels, filters=entropy_filters),
+                *(
+                    CrossScaleConditionalEntropy(channels)
+                    for _ in range(len(levels) - 1)
+                ),
+            ])
+            self.architecture = 'hybrid_grid_compressed_cross_scale_v1'
 
     @staticmethod
     def _normalize_quant_steps(quant_steps, num_levels):
@@ -107,10 +131,23 @@ class CompressedHybridGridNet(nn.Module):
                 quant_mode=effective_mode,
             )
 
-        likelihoods = tuple(
-            entropy_model(result.grid / result.quant_step)
-            for entropy_model, result in zip(self.entropy_models, quantized)
+        normalized = tuple(
+            result.grid / result.quant_step for result in quantized
         )
+        if self.entropy_model_type == 'factorized':
+            likelihoods = tuple(
+                entropy_model(values)
+                for entropy_model, values in zip(self.entropy_models, normalized)
+            )
+        else:
+            likelihoods = [self.entropy_models[0](normalized[0])]
+            likelihoods.extend(
+                self.entropy_models[index](
+                    normalized[index], normalized[index - 1],
+                )
+                for index in range(1, len(normalized))
+            )
+            likelihoods = tuple(likelihoods)
         rate = estimate_grid_rate(likelihoods)
         reconstruction = self.reconstruction_model(coords, grids=grids)
         return CompressedModelOutput(

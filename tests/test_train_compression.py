@@ -45,6 +45,7 @@ def make_config(**overrides):
         'pe_freq': 2,
         'hidden_dim': 16,
         'quant_step': 0.1,
+        'entropy_model': 'factorized',
         'epochs': 300,
         'warmup_epochs': 30,
         'symbol_start_epoch': 270,

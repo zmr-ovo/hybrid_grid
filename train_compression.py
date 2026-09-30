@@ -37,6 +37,7 @@ from util import NervLoss, msssim_fn, psnr_fn
 CHECKPOINT_CONFIG_KEYS = (
     'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
     'aspect_ratio', 'time_scale', 'pe_freq', 'hidden_dim', 'quant_step',
+    'entropy_model',
     'epochs', 'warmup_epochs', 'symbol_start_epoch', 'lambda_max',
     'network_qat', 'network_quant_bits', 'network_quant_start_epoch',
     'network_quant_freeze_epoch',
@@ -607,6 +608,7 @@ def build_compression_model(args, device):
     model = CompressedHybridGridNet(
         reconstruction_model,
         quant_steps=args.quant_step,
+        entropy_model=getattr(args, 'entropy_model', 'factorized'),
     )
     if getattr(args, 'network_qat', False):
         grid_parameters = tuple(
@@ -615,7 +617,12 @@ def build_compression_model(args, device):
         bits = args.network_quant_bits
         prepare_network_qat(model, bits, excluded_parameters=grid_parameters)
         model.network_quant_bits = bits
-        model.architecture = 'hybrid_grid_compressed_mixed_qat_v2'
+        if model.entropy_model_type == 'cross_scale':
+            model.architecture = (
+                'hybrid_grid_compressed_cross_scale_mixed_qat_v1'
+            )
+        else:
+            model.architecture = 'hybrid_grid_compressed_mixed_qat_v2'
     return model.to(device)
 
 
@@ -653,6 +660,9 @@ def train_compression(args):
     logger.info("压缩模型参数: %d", total_params)
     logger.info("重建模型参数: %d", reconstruction_params)
     logger.info("熵模型参数: %d", entropy_params)
+    logger.info("熵模型类型: %s", model.entropy_model_type)
+    if model.entropy_model_type == 'cross_scale':
+        logger.info("熵模型条件关系: L0 factorized; Lk conditioned on L(k-1)")
     initial_rate = estimate_fp32_rate(
         total_video_pixels,
         non_grid_storage,
@@ -905,6 +915,12 @@ def build_parser():
     parser.add_argument('--symbol_start_epoch', type=int, default=270)
     parser.add_argument('--lambda_max', type=float, default=5e-4)
     parser.add_argument('--quant_step', type=float, default=1e-3)
+    parser.add_argument(
+        '--entropy_model',
+        choices=('factorized', 'cross_scale'),
+        default='factorized',
+        help='Grid 概率模型；cross_scale 使用前一低分辨率层作为条件',
+    )
     parser.add_argument(
         '--network_qat', action='store_true',
         help='对非 Grid 的二维 Linear 权重启用按输出通道模拟量化',
