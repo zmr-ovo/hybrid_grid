@@ -3,7 +3,10 @@ import unittest
 import torch
 from torch import nn
 
-from compression.conditional_entropy import CrossScaleConditionalEntropy
+from compression.conditional_entropy import (
+    CrossScaleConditionalEntropy,
+    CumulativeCrossScaleEntropy,
+)
 from compression.entropy_bottleneck import EntropyBottleneck
 from compression.model import CompressedHybridGridNet
 from model import HybridGridNet
@@ -60,6 +63,38 @@ class CompressedModelTest(unittest.TestCase):
         self.assertEqual(
             output.likelihoods[1].shape,
             baseline.grid_encoder.levels[1].grid.shape,
+        )
+        self.assertTrue(all(
+            level.grid.grad is not None
+            for level in baseline.grid_encoder.levels
+        ))
+        self.assertTrue(all(
+            parameter.grad is not None
+            for parameter in model.entropy_models.parameters()
+        ))
+
+    def test_recursive_cross_scale_uses_cumulative_context(self):
+        baseline = make_baseline()
+        model = CompressedHybridGridNet(
+            baseline,
+            quant_steps=[0.1, 0.2],
+            entropy_model='cross_scale_recursive',
+        )
+
+        output = model(torch.rand(1, 3, 4, 5), quant_mode='noise')
+        loss = output.reconstruction.mean() + output.rate.bits_per_value
+        loss.backward()
+
+        self.assertEqual(model.entropy_model_type, 'cross_scale_recursive')
+        self.assertEqual(len(model.entropy_models), 1)
+        self.assertIsInstance(
+            model.entropy_models[0], CumulativeCrossScaleEntropy,
+        )
+        self.assertEqual(len(output.likelihoods), 2)
+        self.assertEqual(model.quant_steps, (0.1, 0.2))
+        self.assertEqual(
+            model.architecture,
+            'hybrid_grid_compressed_cross_scale_recursive_v1',
         )
         self.assertTrue(all(
             level.grid.grad is not None

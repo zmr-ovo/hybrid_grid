@@ -45,6 +45,7 @@ def make_config(**overrides):
         'pe_freq': 2,
         'hidden_dim': 16,
         'quant_step': 0.1,
+        'quant_steps': None,
         'entropy_model': 'factorized',
         'epochs': 300,
         'warmup_epochs': 30,
@@ -123,6 +124,27 @@ class RateDistortionLossTest(unittest.TestCase):
         expected = distortion + 1e-3 * output.rate.bits_per_value
         self.assertTrue(torch.equal(rate, output.rate.bits_per_value))
         self.assertTrue(torch.equal(total, expected))
+
+    def test_build_model_uses_per_level_quantization_steps(self):
+        config = make_config(quant_steps=[0.1, 0.2])
+
+        model = build_compression_model(config, torch.device('cpu'))
+
+        self.assertEqual(model.quant_steps, (0.1, 0.2))
+
+    def test_recursive_entropy_and_network_qat_can_be_combined(self):
+        config = make_config(
+            entropy_model='cross_scale_recursive',
+            network_qat=True,
+        )
+
+        model = build_compression_model(config, torch.device('cpu'))
+
+        self.assertEqual(model.entropy_model_type, 'cross_scale_recursive')
+        self.assertEqual(
+            model.architecture,
+            'hybrid_grid_compressed_cross_scale_recursive_mixed_qat_v1',
+        )
 
     def test_storage_rate_excludes_grid_from_fp32_network_bits(self):
         model = make_model()

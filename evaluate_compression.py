@@ -41,6 +41,7 @@ def load_compression_model(checkpoint_path, device):
     config = Namespace(**saved_config)
     for name, value in (
         ('entropy_model', 'factorized'),
+        ('quant_steps', None),
         ('network_qat', False),
         ('network_quant_bits', 8),
         ('network_quant_start_epoch', 30),
@@ -120,12 +121,17 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
     )
     entropy_key = 'entropy_model_fp32'
 
+    configured_steps = getattr(config, 'quant_steps', None)
+    quantization_steps = (
+        config.quant_step if configured_steps is None
+        else list(configured_steps)
+    )
     report = {
         'schema_version': 4,
         'checkpoint': str(Path(checkpoint_path).resolve()),
         'checkpoint_epoch': checkpoint_epoch,
         'quant_mode': 'symbols',
-        'quant_step': config.quant_step,
+        'quant_step': quantization_steps,
         'entropy_model': getattr(config, 'entropy_model', 'factorized'),
         'network_qat': {
             'enabled': qat_enabled,
@@ -149,6 +155,7 @@ def build_evaluation_report(checkpoint_path, checkpoint_epoch, config,
             'pe_freq': config.pe_freq,
             'hidden_dim': config.hidden_dim,
             'entropy_model': getattr(config, 'entropy_model', 'factorized'),
+            'quant_steps': list(metadata.quant_steps),
         },
         'sequence': {
             'data_root': str(Path(data_root).resolve()),
@@ -230,7 +237,7 @@ def format_evaluation_report(report):
         'Checkpoint: {}'.format(report['checkpoint']),
         'Checkpoint epoch: {}'.format(report['checkpoint_epoch']),
         'Quant mode: symbols',
-        'Quant step: {}'.format(report['quant_step']),
+        'Quant step(s): {}'.format(report['quant_step']),
         'Entropy model: {}'.format(report['entropy_model']),
         'Network QAT: {}'.format(
             '{}-bit'.format(network_qat['bits'])

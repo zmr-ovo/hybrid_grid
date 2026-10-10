@@ -37,6 +37,7 @@ from util import NervLoss, msssim_fn, psnr_fn
 CHECKPOINT_CONFIG_KEYS = (
     'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
     'aspect_ratio', 'time_scale', 'pe_freq', 'hidden_dim', 'quant_step',
+    'quant_steps',
     'entropy_model',
     'epochs', 'warmup_epochs', 'symbol_start_epoch', 'lambda_max',
     'network_qat', 'network_quant_bits', 'network_quant_start_epoch',
@@ -534,8 +535,17 @@ def _validate_args(args):
         args.symbol_start_epoch,
         args.lambda_max,
     )
-    if not math.isfinite(args.quant_step) or args.quant_step <= 0:
-        raise ValueError("quant_step must be finite and positive")
+    quant_steps = getattr(args, 'quant_steps', None)
+    if quant_steps is None:
+        if not math.isfinite(args.quant_step) or args.quant_step <= 0:
+            raise ValueError("quant_step must be finite and positive")
+    else:
+        if len(quant_steps) != args.grid_levels:
+            raise ValueError(
+                "quant_steps must contain one value per Grid level"
+            )
+        if any(not math.isfinite(step) or step <= 0 for step in quant_steps):
+            raise ValueError("quant_steps must be finite and positive")
     if args.batch_size < 1:
         raise ValueError("batch_size must be positive")
     if args.dynamic_res and args.batch_size != 1:
@@ -607,7 +617,11 @@ def build_compression_model(args, device):
     )
     model = CompressedHybridGridNet(
         reconstruction_model,
-        quant_steps=args.quant_step,
+        quant_steps=(
+            args.quant_step
+            if getattr(args, 'quant_steps', None) is None
+            else args.quant_steps
+        ),
         entropy_model=getattr(args, 'entropy_model', 'factorized'),
     )
     if getattr(args, 'network_qat', False):
@@ -620,6 +634,10 @@ def build_compression_model(args, device):
         if model.entropy_model_type == 'cross_scale':
             model.architecture = (
                 'hybrid_grid_compressed_cross_scale_mixed_qat_v1'
+            )
+        elif model.entropy_model_type == 'cross_scale_recursive':
+            model.architecture = (
+                'hybrid_grid_compressed_cross_scale_recursive_mixed_qat_v1'
             )
         else:
             model.architecture = 'hybrid_grid_compressed_mixed_qat_v2'
@@ -661,8 +679,14 @@ def train_compression(args):
     logger.info("重建模型参数: %d", reconstruction_params)
     logger.info("熵模型参数: %d", entropy_params)
     logger.info("熵模型类型: %s", model.entropy_model_type)
+    logger.info("Grid 分层量化步长: %s", list(model.quant_steps))
     if model.entropy_model_type == 'cross_scale':
         logger.info("熵模型条件关系: L0 factorized; Lk conditioned on L(k-1)")
+    elif model.entropy_model_type == 'cross_scale_recursive':
+        logger.info(
+            "熵模型条件关系: L0 factorized; fixed-width recursive context "
+            "summarizes all decoded lower levels"
+        )
     initial_rate = estimate_fp32_rate(
         total_video_pixels,
         non_grid_storage,
@@ -799,7 +823,12 @@ def train_compression(args):
         writer.add_scalar('train/best_psnr', best_train_psnr, epoch + 1)
         writer.add_scalar('train/msssim', avg_msssim, epoch + 1)
         writer.add_scalar('train/lambda_rate', stage.lambda_rate, epoch + 1)
-        writer.add_scalar('train/quant_step', args.quant_step, epoch + 1)
+        for level_index, quant_step in enumerate(model.quant_steps):
+            writer.add_scalar(
+                'train/quant_step_level_{}'.format(level_index),
+                quant_step,
+                epoch + 1,
+            )
         writer.add_scalar('train/lr', learning_rate, epoch + 1)
         writer.add_scalar(
             'train/quant_mode',
@@ -916,10 +945,20 @@ def build_parser():
     parser.add_argument('--lambda_max', type=float, default=5e-4)
     parser.add_argument('--quant_step', type=float, default=1e-3)
     parser.add_argument(
+        '--quant_steps', type=float, nargs='+',
+        help=(
+            '每层固定 Grid 量化步长；提供后覆盖 --quant_step，数量必须与 '
+            '--grid_levels 一致'
+        ),
+    )
+    parser.add_argument(
         '--entropy_model',
-        choices=('factorized', 'cross_scale'),
+        choices=('factorized', 'cross_scale', 'cross_scale_recursive'),
         default='factorized',
-        help='Grid 概率模型；cross_scale 使用前一低分辨率层作为条件',
+        help=(
+            'Grid 概率模型；cross_scale 使用前一层，'
+            'cross_scale_recursive 累计所有已解码低层条件'
+        ),
     )
     parser.add_argument(
         '--network_qat', action='store_true',

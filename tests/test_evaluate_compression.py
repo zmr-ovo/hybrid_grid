@@ -36,6 +36,7 @@ def make_config():
         pe_freq=2,
         hidden_dim=16,
         quant_step=0.1,
+        quant_steps=None,
         entropy_model='factorized',
         epochs=300,
         warmup_epochs=30,
@@ -138,6 +139,28 @@ class CompressionEvaluationReportTest(unittest.TestCase):
         self.assertEqual(restored.architecture, model.architecture)
         for expected, actual in zip(model.parameters(), restored.parameters()):
             self.assertTrue(torch.equal(expected, actual))
+
+    def test_loads_recursive_entropy_with_per_level_steps(self):
+        config = make_config()
+        config.entropy_model = 'cross_scale_recursive'
+        config.quant_steps = [0.1, 0.2]
+        model = build_compression_model(config, torch.device('cpu'))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'recursive.pth'
+            save_compression_checkpoint(
+                model, optimizer, 1, 20.0, 21.0, config, path,
+            )
+            restored, restored_config, epoch = load_compression_model(
+                path, torch.device('cpu'),
+            )
+
+        self.assertEqual(epoch, 2)
+        self.assertEqual(restored_config.quant_steps, [0.1, 0.2])
+        self.assertEqual(restored.quant_steps, (0.1, 0.2))
+        self.assertEqual(
+            restored.entropy_model_type, 'cross_scale_recursive',
+        )
 
 
 if __name__ == '__main__':
