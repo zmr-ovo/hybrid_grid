@@ -31,6 +31,9 @@ class CheckpointTest(unittest.TestCase):
             path = Path(temp_dir) / 'checkpoint.pth'
             model = nn.Linear(2, 1)
             optimizer = torch.optim.Adam(model.parameters())
+            model(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
                 model.weight.fill_(2.0)
 
@@ -52,6 +55,38 @@ class CheckpointTest(unittest.TestCase):
             self.assertEqual(best_val_psnr, 31.5)
             self.assertEqual(best_train_psnr, 33.0)
             self.assertTrue(torch.equal(model.weight, restored_model.weight))
+            for state in restored_optimizer.state.values():
+                self.assertEqual(state['step'].device.type, 'cpu')
+
+            restored_model(torch.ones(1, 2)).sum().backward()
+            restored_optimizer.step()
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is required')
+    def test_cuda_resume_keeps_adam_step_on_cpu(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'checkpoint.pth'
+            device = torch.device('cuda')
+            model = nn.Linear(2, 1).to(device)
+            optimizer = torch.optim.Adam(model.parameters())
+            model(torch.ones(1, 2, device=device)).sum().backward()
+            optimizer.step()
+            save_checkpoint(
+                model, optimizer, 0, 0.0, 0.0, make_config(), path,
+            )
+
+            restored_model = nn.Linear(2, 1).to(device)
+            restored_optimizer = torch.optim.Adam(restored_model.parameters())
+            load_checkpoint(
+                path, restored_model, device, make_config(), restored_optimizer,
+            )
+
+            for state in restored_optimizer.state.values():
+                self.assertEqual(state['step'].device.type, 'cpu')
+                self.assertEqual(state['exp_avg'].device.type, 'cuda')
+                self.assertEqual(state['exp_avg_sq'].device.type, 'cuda')
+
+            restored_model(torch.ones(1, 2, device=device)).sum().backward()
+            restored_optimizer.step()
 
     def test_rejects_incompatible_model_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -113,11 +113,26 @@ def _validate_model_config(saved_config, current_config):
         raise ValueError(f"模型配置与检查点不一致: {details}")
 
 
+def _restore_optimizer_state_device(optimizer, device):
+    """Restore Adam state with CPU step counters for capturable=False."""
+    for state in optimizer.state.values():
+        for name, value in tuple(state.items()):
+            if not torch.is_tensor(value):
+                continue
+            if name == 'step':
+                state[name] = value.cpu()
+            else:
+                state[name] = value.to(device)
+
+
 def load_checkpoint(path, model, device, config, optimizer=None):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"未找到检查点: {path}")
 
-    checkpoint = torch.load(path, map_location=device)
+    # Optimizer step counters must remain on CPU for the default Adam
+    # (capturable=False). Load on CPU first, then move model/moment tensors
+    # explicitly to their required devices.
+    checkpoint = torch.load(path, map_location='cpu')
     saved_architecture = checkpoint.get('architecture')
     current_architecture = getattr(model, 'architecture', model.__class__.__name__)
     if saved_architecture is None:
@@ -134,13 +149,14 @@ def load_checkpoint(path, model, device, config, optimizer=None):
         if 'optimizer' not in checkpoint:
             raise KeyError("检查点缺少 optimizer 状态，无法恢复训练")
         optimizer.load_state_dict(checkpoint['optimizer'])
+        _restore_optimizer_state_device(optimizer, device)
 
     start_epoch = int(checkpoint.get('epoch', -1)) + 1
     best_val_psnr = float(checkpoint.get('best_val_psnr', 0.0))
     best_train_psnr = float(checkpoint.get('best_train_psnr', 0.0))
     return start_epoch, best_val_psnr, best_train_psnr
 
-def train(args):
+def train(args, model_class=HybridGridNet):
     # 初始化
     seed_everything(args.seed)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -197,7 +213,7 @@ def train(args):
     )
 
     # 模型
-    model = HybridGridNet(
+    model = model_class(
         grid_levels=args.grid_levels,
         grid_feat_dim=args.grid_feat_dim,
         base_resolution=args.base_resolution,

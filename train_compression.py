@@ -35,6 +35,7 @@ from util import NervLoss, msssim_fn, psnr_fn
 
 
 CHECKPOINT_CONFIG_KEYS = (
+    'reconstruction_model',
     'grid_levels', 'grid_feat_dim', 'base_resolution', 'finest_resolution',
     'aspect_ratio', 'time_scale', 'pe_freq', 'hidden_dim', 'quant_step',
     'quant_steps',
@@ -604,8 +605,33 @@ def _make_loaders(args):
     return train_loader, val_loader, train_generator
 
 
-def build_compression_model(args, device):
-    reconstruction_model = HybridGridNet(
+def build_compression_model(
+    args,
+    device,
+    reconstruction_model_class=None,
+    reconstruction_model_name=None,
+):
+    if reconstruction_model_name is None:
+        reconstruction_model_name = getattr(
+            args, 'reconstruction_model', 'paper',
+        )
+    if reconstruction_model_name not in ('paper', 'resnet', 'additive_skip'):
+        raise ValueError(
+            "reconstruction_model must be 'paper', 'resnet', or "
+            "'additive_skip'"
+        )
+
+    if reconstruction_model_class is None:
+        if reconstruction_model_name == 'paper':
+            reconstruction_model_class = HybridGridNet
+        elif reconstruction_model_name == 'resnet':
+            from resnet_baseline.model import ResNetHybridGridNet
+            reconstruction_model_class = ResNetHybridGridNet
+        else:
+            from resnet_baseline.model_1 import ResidualSkipHybridGridNet
+            reconstruction_model_class = ResidualSkipHybridGridNet
+
+    reconstruction_model = reconstruction_model_class(
         grid_levels=args.grid_levels,
         grid_feat_dim=args.grid_feat_dim,
         base_resolution=args.base_resolution,
@@ -641,10 +667,20 @@ def build_compression_model(args, device):
             )
         else:
             model.architecture = 'hybrid_grid_compressed_mixed_qat_v2'
+    architecture_prefixes = {
+        'resnet': 'hybrid_grid_resnet_compressed',
+        'additive_skip': 'hybrid_grid_additive_skip_compressed',
+    }
+    if reconstruction_model_name in architecture_prefixes:
+        model.architecture = model.architecture.replace(
+            'hybrid_grid_compressed',
+            architecture_prefixes[reconstruction_model_name],
+            1,
+        )
     return model.to(device)
 
 
-def train_compression(args):
+def train_compression(args, model_builder=build_compression_model):
     _validate_args(args)
     seed_everything(args.seed)
 
@@ -657,7 +693,7 @@ def train_compression(args):
     logger.info("随机种子: %d", args.seed)
 
     train_loader, val_loader, train_generator = _make_loaders(args)
-    model = build_compression_model(args, device)
+    model = model_builder(args, device)
     total_video_pixels = (
         len(val_loader.dataset) * args.fixed_res[0] * args.fixed_res[1]
     )

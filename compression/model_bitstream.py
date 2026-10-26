@@ -47,6 +47,7 @@ _VERSION = 1
 _MANIFEST = 'manifest.json'
 _GRID_ENTRY = 'grids.hgb'
 _CONFIG_KEYS = (
+    'reconstruction_model',
     'grid_levels',
     'grid_feat_dim',
     'base_resolution',
@@ -109,7 +110,8 @@ class ModelBitstreamInfo:
 
 
 def _config_dict(config):
-    source = vars(config) if not isinstance(config, dict) else config
+    source = dict(config) if isinstance(config, dict) else dict(vars(config))
+    source.setdefault('reconstruction_model', 'paper')
     missing = [key for key in _CONFIG_KEYS if key not in source]
     if missing:
         raise ValueError(
